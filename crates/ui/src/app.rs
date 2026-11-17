@@ -2820,8 +2820,14 @@ impl App {
                     let name = result["name"].as_str().unwrap_or_default();
                     self.status = Status::Hint(format!("Preset {name} saved into the library's Presets folder"));
                 }
-                // A new track is selected and scrolled into view (#918).
-                if action.id == "track.add" {
+                // A bounced track's file is said in the status bar.
+                if action.id == "track.bounce" {
+                    let file = result["file"].as_str().map(std::path::Path::new);
+                    let name = file.and_then(|f| f.file_name()).map(|n| n.to_string_lossy().into_owned());
+                    self.status = Status::Hint(format!("Bounced to {}", name.unwrap_or_default()));
+                }
+                // A new track is selected and scrolled into view (#918); so is a bounce's.
+                if matches!(action.id, "track.add" | "track.bounce") {
                     let id = |t: &serde_json::Value| t.as_u64().and_then(|t| u32::try_from(t).ok()).map(TrackId);
                     let tracks: Vec<TrackId> = match result["tracks"].as_array() {
                         Some(added) => added.iter().filter_map(id).collect(),

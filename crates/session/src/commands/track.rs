@@ -382,6 +382,19 @@ pub(super) static COMMANDS: &[CommandSpec] = &[
         run: crate::sends::set_send_mode,
         policy: Policy::DEFAULT,
     },
+    CommandSpec {
+        id: "track.bounce",
+        label: "Render an audio or MIDI track through its devices, before its volume and pan, to a WAV file next to the project, on a new audio track after it that takes its mixer settings; the track is muted",
+        params: &[
+            TRACK,
+            optional("start", ParamType::Number, "the first beat (default: the bar of the track's first clip)"),
+            optional("end", ParamType::Number, "the last beat (default: the end of the track's last clip)"),
+            optional("tail", ParamType::Number, "beats rendered past the end, 0 to 64 (default: one bar)"),
+        ],
+        kind: CommandKind::EDIT,
+        run: crate::bounce::bounce,
+        policy: Policy::DEFAULT,
+    },
 ];
 
 fn set_volume(session: &mut Session, params: &Value) -> Result<Value, CommandError> {

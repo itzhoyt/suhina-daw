@@ -340,7 +340,7 @@ pub(crate) fn sanitized(name: &str) -> String {
 }
 
 /// `<folder>/<name>.wav`, or with " 2", " 3" … after the name when that file exists.
-fn free_path(folder: &Path, name: &str) -> Result<PathBuf, CommandError> {
+pub(crate) fn free_path(folder: &Path, name: &str) -> Result<PathBuf, CommandError> {
     for n in 1..=MAX_NAME_TRIES {
         let file = if n == 1 { format!("{name}.wav") } else { format!("{name} {n}.wav") };
         let path = folder.join(file);
@@ -354,7 +354,7 @@ fn free_path(folder: &Path, name: &str) -> Result<PathBuf, CommandError> {
 /// Writes interleaved stereo as a 32-bit float WAV file, through the one writer every export
 /// and preview writes with (`media::write`). A bounce rewrites whatever it wrote before, by
 /// its own new name each time.
-fn write_wav(path: &Path, rate: u32, samples: &[f32]) -> Result<(), CommandError> {
+pub(crate) fn write_wav(path: &Path, rate: u32, samples: &[f32]) -> Result<(), CommandError> {
     use suhina_media::write::WriteMode;
     suhina_media::write::write_audio_file(
         path,

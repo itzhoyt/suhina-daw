@@ -238,8 +238,8 @@ pub fn midi_input_choices(ui: &mut Ui, track: TrackId, input: &MidiInput, ports:
     midi_monitor_choices(ui, track, input.monitor, actions);
 }
 
-/// The menu of a track header or column: name, colour, group, ungroup, move into or out of a
-/// group, delete.
+/// The menu of a track header or column: name, colour, inputs, bounce, group, ungroup, move into
+/// or out of a group, delete.
 pub fn track_menu(ui: &mut Ui, menu: &TrackMenu<'_>, actions: &mut Vec<Action>) {
     let track = menu.track.0;
     // A compact menu: as wide as its widest item needs, never the window's width.
@@ -306,6 +306,15 @@ pub fn track_menu(ui: &mut Ui, menu: &TrackMenu<'_>, actions: &mut Vec<Action>) 
         ui.menu_button(format!("MIDI input: {}", midi_input_text(input)), |ui| {
             midi_input_choices(ui, menu.track, input, ports, actions);
         });
+    }
+    // An audio or MIDI track rendered through its devices onto a new audio track
+    // (docs/spec/bounce.md).
+    if !menu.is_group && !menu.is_return && (menu.audio.is_some() || menu.midi.is_some()) {
+        ui.separator();
+        if ui.button("Bounce to new track").clicked() {
+            actions.push(Action::new("track.bounce", json!({ "track": track })));
+            ui.close();
+        }
     }
     ui.separator();
 

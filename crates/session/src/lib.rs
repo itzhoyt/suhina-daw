@@ -34,6 +34,7 @@ mod automation_fit;
 mod automation_range;
 pub mod backup;
 mod blank;
+mod bounce;
 mod clip_ara;
 mod clip_audio;
 mod clip_color;
