@@ -364,4 +364,5 @@ step.
 - Punch in and out points.
 - Hearing a take lane on its own (audition), and marking on a take which parts are on the track.
 - Recording automation (a moved parameter written as a lane).
-- Recording a track's output (resampling) rather than its input.
+- Recording a track's output (resampling) rather than its input; a track can be bounced to a
+  new audio track offline ([bounce.md](bounce.md)).

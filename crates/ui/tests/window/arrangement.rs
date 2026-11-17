@@ -704,6 +704,31 @@ fn menus_delete_a_track_and_duplicate_a_clip() {
 }
 
 #[test]
+fn the_track_menu_bounces_a_track_to_a_new_one() {
+    let dir = crate::temp_dir::TempDir::new("ui-bounce");
+    let file = dir.join("Song.suhina");
+    Session::new(demo_project()).save(&file, false).unwrap();
+    let mut app = App::new();
+    app.set_browser_open(false);
+    app.set_session(Session::open(&file).unwrap().0, &[]);
+    let mut harness = window(app);
+    harness.get_by_label("Arrangement view").click();
+    harness.run();
+
+    harness.get_by_label("Track Keys").click_secondary();
+    harness.run();
+    harness.get_by_label("Bounce to new track").click();
+    harness.run();
+    let at = names(&harness).iter().position(|n| n == "Keys").unwrap();
+    assert_eq!(names(&harness).get(at + 1).map(String::as_str), Some("Keys bounce"));
+    let session = harness.state().session().unwrap();
+    let p = session.project();
+    let keys = p.tracks.iter().find(|t| t.name == "Keys").and_then(|t| t.channel).unwrap();
+    assert!(p.channel(keys).unwrap().mute, "the bounced track is muted");
+    assert!(dir.join("Bounced").join("Keys bounce.wav").is_file());
+}
+
+#[test]
 fn dragging_a_header_moves_the_track() {
     let mut harness = arrangement_app();
     let from = harness.get_by_label("Track Vox").rect().center();

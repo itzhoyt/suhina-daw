@@ -57,7 +57,7 @@ impl TrackKind {
         }
     }
 
-    fn of(track: &Track) -> Option<Self> {
+    pub(crate) fn of(track: &Track) -> Option<Self> {
         if track.content.audio {
             Some(Self::Audio)
         } else if track.content.notes {

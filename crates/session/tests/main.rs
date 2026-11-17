@@ -10,6 +10,7 @@
 mod audio;
 mod audio_input;
 mod automation;
+mod bounce;
 mod clip_ara;
 mod clip_audio;
 mod clip_automation;
