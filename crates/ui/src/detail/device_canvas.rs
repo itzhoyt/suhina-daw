@@ -2293,6 +2293,12 @@ pub(crate) fn show(
             super::eq_curve::show(ui, bounds, parameters, track, at, actions);
             continue;
         }
+        // The FilterCurve is host-drawn too: the validator only lets the built-in Filter's own
+        // parameter set claim it.
+        if matches!(control.widget, Some(Widget::FilterCurve)) {
+            super::filter_curve::show(ui, bounds, parameters, track, at, actions);
+            continue;
+        }
         if let Some(Widget::Handle { color: line_color, span, offset, dot, relative, hollow }) = &control.widget {
             handle(
                 ui,

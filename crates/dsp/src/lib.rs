@@ -17,13 +17,14 @@
 //! dB/octave), LFO waveforms (with a smoothly wandering random one) and their tempo sync (rate
 //! modes, an LFO clock locked to the song), waveshapers, a 2× oversampler (linear phase) and a
 //! low-latency one (IIR half-band), first-order filters and shelves, a state-variable filter with
-//! every second-order response, delay lines with linear and cubic interpolation and a Schroeder
+//! every second-order response (and an all-pass), a feedback comb filter, delay lines with linear and cubic interpolation and a Schroeder
 //! allpass, a trim delay that moves smoothly while running, a windowed-sinc polyphase resampler and
 //! IR convolution (uniform-partitioned, `fft-convolver`) with its `Ir`. Real-time safe, panic-free
 //! on any input.
 
 pub mod analyser;
 pub mod biquad;
+pub mod comb;
 pub mod convolver;
 pub mod crossover;
 pub mod dc;
@@ -46,6 +47,7 @@ pub mod trim_delay;
 
 pub use analyser::Analyser;
 pub use biquad::{Biquad, Coefficients};
+pub use comb::Comb;
 pub use convolver::{Convolver, Ir, MAX_FRAMES as IR_MAX_FRAMES, PARTITION};
 pub use crossover::{LinkwitzRiley, Slope};
 pub use dc::DcBlocker;

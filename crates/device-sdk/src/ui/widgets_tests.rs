@@ -3,6 +3,32 @@
 
 use super::*;
 #[test]
+fn the_filter_curve_takes_no_binding_and_needs_the_filters_parameters() {
+    let control = |x: Option<UiBinding>| CustomControl {
+        widget: Some(Widget::FilterCurve),
+        id: "curve".into(),
+        name: "Filter curve".into(),
+        tooltip: String::new(),
+        bounds: [0., 0., 240., 140.],
+        visible_when: None,
+        gesture: UiGesture::Drag,
+        x,
+        y: None,
+        drawing: vec![],
+    };
+    let parameters: Vec<Parameter> = ["type", "frequency", "resonance", "gain", "morph"]
+        .iter()
+        .map(|id| Parameter::new(*id, *id, (0., 1.), 0.))
+        .collect();
+    let ui = DeviceUi { controls: vec![control(None)], ..DeviceUi::default() };
+    assert!(ui.validate(&parameters).is_ok());
+    assert!(ui.controls[0].drawings().is_empty(), "the host draws it");
+    let ui = DeviceUi { controls: vec![control(Some(UiBinding::new("frequency")))], ..DeviceUi::default() };
+    assert!(ui.validate(&parameters).is_err(), "it edits the parameters by id, not through a binding");
+    let ui = DeviceUi { controls: vec![control(None)], ..DeviceUi::default() };
+    assert!(ui.validate(&parameters[..4]).is_err(), "without the filter's parameters it is no filter's display");
+}
+#[test]
 fn the_eq_curves_display_takes_no_binding_and_draws_nothing_of_its_own() {
     let control = |x: Option<UiBinding>, y: Option<UiBinding>| CustomControl {
         widget: Some(Widget::EqCurve),

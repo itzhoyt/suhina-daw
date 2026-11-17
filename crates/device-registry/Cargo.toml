@@ -12,6 +12,7 @@ suhina-device-utility.workspace = true
 suhina-device-auto-pan.workspace = true
 suhina-device-dj-eq.workspace = true
 suhina-device-eq.workspace = true
+suhina-device-filter.workspace = true
 suhina-device-vinyl-distortion.workspace = true
 suhina-device-overdrive.workspace = true
 suhina-device-saturator.workspace = true

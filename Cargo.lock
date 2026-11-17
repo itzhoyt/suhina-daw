@@ -5461,6 +5461,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "suhina-device-filter"
+version = "0.0.1"
+dependencies = [
+ "suhina-device-api",
+ "suhina-device-sdk",
+ "suhina-dsp",
+]
+
+[[package]]
 name = "suhina-device-fm-synth"
 version = "0.0.1"
 dependencies = [
@@ -5533,6 +5542,7 @@ dependencies = [
  "suhina-device-delay",
  "suhina-device-dj-eq",
  "suhina-device-eq",
+ "suhina-device-filter",
  "suhina-device-fm-synth",
  "suhina-device-limiter",
  "suhina-device-multiband",
@@ -5886,6 +5896,7 @@ dependencies = [
  "serde_json",
  "suhina-device-api",
  "suhina-device-eq",
+ "suhina-device-filter",
  "suhina-device-registry",
  "suhina-device-sdk",
  "suhina-dsp",

@@ -245,6 +245,12 @@ pub enum Widget {
     /// them. The host finds the band parameters by their ids (`a1Frequency` … `b8Q`); which
     /// band is selected is panel state, never a parameter (docs/spec/eq.md › The panel).
     EqCurve,
+    /// Host-drawn response display of the built-in Filter: the grid, the curve of the filter
+    /// as its parameters set it, the curve as the LFO has moved it (from the device's
+    /// readouts) and the range the LFO sweeps, with a dot dragged sideways for the frequency
+    /// and up and down for the resonance. The host finds the parameters by their ids
+    /// (`type`, `frequency`, `resonance`, `gain`, `morph`; docs/spec/filter.md › The panel).
+    FilterCurve,
 }
 
 /// What a [`Widget::DeviceFiles`] control places: the pack row's or file row's dropdown on
@@ -477,7 +483,11 @@ impl Widget {
                     value,
                 ];
             }
-            Self::SampleWaveform | Self::SampleRecording | Self::Envelope { .. } | Self::EqCurve => {}
+            Self::SampleWaveform
+            | Self::SampleRecording
+            | Self::Envelope { .. }
+            | Self::EqCurve
+            | Self::FilterCurve => {}
             // Host-rendered: the host draws them from its own state.
             Self::DeviceSwitch | Self::DeviceFiles { .. } | Self::DeviceNote => {}
             Self::Knob { label } => {

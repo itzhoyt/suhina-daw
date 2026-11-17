@@ -121,17 +121,35 @@ impl SvfCoefficients {
         Self::new(sample_rate, frequency, a.sqrt(), q, [a * a, k * a * (1.0 - a), 1.0 - a * a])
     }
 
+    /// All-pass at `frequency`: every frequency at the same level, the phase turning through
+    /// 360° around it, faster the higher `q` is. The building block of a phaser.
+    pub fn allpass(sample_rate: f64, frequency: f64, q: f64) -> Self {
+        let k = 1.0 / usable_q(q);
+        Self::new(sample_rate, frequency, 1.0, q, [1.0, -2.0 * k, 0.0])
+    }
+
     /// Gain at `frequency` (linear, 1.0 = unchanged), for tests and for drawing response curves.
     pub fn magnitude(&self, sample_rate: f64, frequency: f64) -> f64 {
+        let [re, im] = self.response(sample_rate, frequency);
+        re.hypot(im)
+    }
+
+    /// The complex response at `frequency`, `[real, imaginary]`: what a curve that sums
+    /// sections in parallel or feeds one back needs, where magnitudes alone do not add up.
+    pub fn response(&self, sample_rate: f64, frequency: f64) -> [f64; 2] {
         if self.g <= 0.0 {
-            return self.m0.abs();
+            return [self.m0, 0.0];
         }
         // The digital frequency on the prototype's axis, through the same prewarp.
         let w = (std::f64::consts::PI * frequency / usable_sample_rate(sample_rate)).tan() / self.g;
         // D = p² + k p + 1 and N = m0 D + m1 p + m2 at p = jw.
         let (d_re, d_im) = (1.0 - w * w, self.k * w);
         let (n_re, n_im) = (self.m0 * d_re + self.m2, self.m0 * d_im + self.m1 * w);
-        n_re.hypot(n_im) / d_re.hypot(d_im)
+        let d = d_re * d_re + d_im * d_im;
+        if !(d.is_finite() && d > 0.0) {
+            return [self.m0, 0.0];
+        }
+        [(n_re * d_re + n_im * d_im) / d, (n_im * d_re - n_re * d_im) / d]
     }
 }
 
@@ -267,5 +285,29 @@ mod tests {
         let out: Vec<f64> = (0..100).map(|i| svf.process((i as f64 * 0.1).sin())).collect();
         assert!(out.iter().all(|v| v.is_finite()));
         assert!(SvfCoefficients::lowpass(SR, 0.0, 0.7).magnitude(SR, 100.0) > 0.0);
+    }
+
+    #[test]
+    fn the_allpass_keeps_every_level_and_turns_the_phase() {
+        let c = SvfCoefficients::allpass(SR, 1_000.0, 0.7);
+        for hz in [30.0, 300.0, 1_000.0, 3_000.0, 15_000.0] {
+            assert!((c.magnitude(SR, hz) - 1.0).abs() < 1e-9, "{hz}");
+            assert!((measured(c, hz) - 1.0).abs() < 0.01, "{hz}");
+        }
+        // Half way round at its frequency: the output is the input upside down.
+        let [re, im] = c.response(SR, 1_000.0);
+        assert!((re + 1.0).abs() < 1e-9 && im.abs() < 1e-9, "{re} {im}");
+    }
+
+    #[test]
+    fn the_complex_response_has_the_magnitude() {
+        let c = SvfCoefficients::bandpass(SR, 700.0, 3.0);
+        for hz in [50.0, 700.0, 9_000.0] {
+            let [re, im] = c.response(SR, hz);
+            assert!((re.hypot(im) - measured(c, hz)).abs() < 0.01, "{hz}");
+        }
+        // At its centre a band-pass passes the input in phase.
+        let [re, im] = c.response(SR, 700.0);
+        assert!((re - 1.0).abs() < 1e-9 && im.abs() < 1e-9);
     }
 }

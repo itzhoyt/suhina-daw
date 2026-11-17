@@ -97,7 +97,7 @@ exists in `devices/`, passes its tests and runs in track chains.
 | saturator: eight curves, Color filters and their inverse, post clip, waveshaper, dry/wet | own, oversampled | done |
 | multi-stage saturation | own, oversampled | planned |
 | EQ: eight bands of eight types, two curves for Stereo, Left/Right or Mid/Side, Scale, Adaptive Q | own (`dsp` state-variable filters) | done, with the panel's response display and its output spectrum's analyser; Audition planned |
-| filter | own (`dsp` filters) | planned |
+| filter: fourteen types (cuts, band-pass, notch, peak, shelves, morph, combs, phaser, formant), drive, an LFO free or synced | own (`dsp` state-variable filters and comb) | done, with the panel's response display |
 | FM synth: six operators, 43 algorithms, waveforms and drawn partials, DX7 and time envelopes, filter and shaper, two LFOs, modulation matrix, spread, randomizer ([spec](docs/spec/fm-synth.md)) | MSFA (Apache-2.0) via Dexed, own parts around it | done; import from Live Sets planned |
 | wavetable synth | Vital (GPL-3.0), under its own name | planned |
 | subtractive synth | own, Surge XT (GPL-3.0) for reference | planned |
