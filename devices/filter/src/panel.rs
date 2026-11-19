@@ -61,7 +61,7 @@ fn dial(id: &str, label: &str, x: f32, row: usize, logarithmic: bool, decimals: 
         id,
         label,
         [x, row as f32 * DIAL[1], DIAL[0], DIAL[1]],
-        Widget::Dial { label: label.into(), decimals, format: TextFormat::Number },
+        Widget::Dial { label: label.into(), decimals, format: TextFormat::Number, image: None },
     );
     c.tooltip = TOOLTIP.into();
     c.y = Some(UiBinding { parameter: id.into(), logarithmic, drag_scale: 1.0 });

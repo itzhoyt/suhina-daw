@@ -615,6 +615,7 @@ fn param(id: u32, name: &str, steps: u32, value: f64) -> suhina_plugins::ParamIn
         value,
         text: format!("{name} at {value}"),
         steps,
+        list: false,
         automatable: true,
         read_only: false,
         hidden: false,
@@ -687,6 +688,111 @@ fn automation_replaces_a_plug_ins_listed_text_with_the_value_it_plays() {
     let shown: Vec<_> = graph.parameters.iter().map(|p| (p.value, p.text.as_str())).collect();
     assert_eq!(shown, [(0.75, ""), (1.0, "")]);
     assert_eq!(value_text(&graph.parameters[0], 0.75), "0.75");
+}
+
+/// A plug-in parameter whose played value is the one the panel already shows, without a text
+/// (the project keeps a value the plug-in did not list), still takes the plug-in's text for it, or
+/// asks for it; a listed text for the value played stays (#1482).
+#[test]
+fn an_unmoved_automated_value_still_takes_the_plug_ins_text() {
+    use suhina_engine::model::{AutomationLane, AutomationPoint};
+    let mut project = with_plugin();
+    let point = |beat, value| AutomationPoint { beat, value, curve: Default::default() };
+    let flat = |param: &str, value: f64| AutomationLane {
+        param: param.into(),
+        points: vec![point(0.0, value), point(8.0, value)].into(),
+        enabled: true,
+    };
+    // Mix keeps 0.25 in the project (listed at 0.5 with its text); Bypass plays what it listed.
+    project.channels[0].devices[0].params.push(suhina_engine::model::DeviceParam::new("1", 0.25));
+    project.channels[0].devices[0].automation = vec![flat("1", 0.25), flat("2", 0.0)];
+    let build = || {
+        build_with(
+            &project,
+            Some(TrackId(1)),
+            None,
+            &mut |_, _| Some(listing(PluginStatus::Running)),
+            crate::detail::device_widgets::Lists::default(),
+        )
+    };
+    let texts = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let text_of = |detail: &Detail, id: &str| {
+        let Detail::Devices(chain) = detail else { panic!() };
+        let graph = chain.devices[0].graph.as_ref().unwrap();
+        graph.parameters.iter().find(|p| p.id == id).map(|p| (p.value, p.text.clone())).unwrap()
+    };
+    // Not named yet: the number, and asked about.
+    let mut detail = build();
+    assert_eq!(text_of(&detail, "1"), (0.25, String::new()), "the value kept, without a text");
+    let wanted = detail.follow_automation_texts(&project, 4.0, None, &mut |_, _| Some(std::sync::Arc::clone(&texts)));
+    assert_eq!(wanted, [(TrackId(1), vec![0], 1, 0.25)]);
+    assert_eq!(text_of(&detail, "2"), (0.0, "Bypass at 0".to_string()), "the listed text stays");
+    // Named: its text, and nothing more to ask.
+    texts.lock().unwrap().insert((1, 0.25f64.to_bits()), "-12.0 dB".to_string());
+    let mut detail = build();
+    let wanted = detail.follow_automation_texts(&project, 4.0, None, &mut |_, _| Some(std::sync::Arc::clone(&texts)));
+    assert!(wanted.is_empty(), "{wanted:?}");
+    assert_eq!(text_of(&detail, "1"), (0.25, "-12.0 dB".to_string()));
+}
+
+/// With the plug-in's own texts at hand, an automated parameter shows the plug-in's text for the
+/// value it plays, and a value it has not named yet shows the number and is given back to be
+/// asked about, on the step the plug-in plays; a knob listed with steps moves along the line,
+/// and only a list of choices holds its value until the next point (#1482).
+#[test]
+fn automation_shows_a_plug_ins_own_text_for_the_value_it_plays() {
+    use suhina_engine::model::{AutomationLane, AutomationPoint};
+    let mut project = with_plugin();
+    let point = |beat, value| AutomationPoint { beat, value, curve: Default::default() };
+    let lane = |param: &str| AutomationLane {
+        param: param.into(),
+        points: vec![point(0.0, 0.0), point(8.0, 1.0)].into(),
+        enabled: true,
+    };
+    project.channels[0].devices[0].automation = vec![lane("1"), lane("5"), lane("6")];
+    let knob = suhina_plugins::ParamInfo { steps: 1024, ..param(5, "Cutoff", 0, 1.0) };
+    let choice = suhina_plugins::ParamInfo { steps: 3, list: true, ..param(6, "Shape", 0, 0.0) };
+    let report = || {
+        let mut report = listing(PluginStatus::Running);
+        let mut list = report.params.as_deref().unwrap_or_default().to_vec();
+        list.extend([knob.clone(), choice.clone()]);
+        report.params = Some(list.into());
+        report
+    };
+    let mut detail = build_with(
+        &project,
+        Some(TrackId(1)),
+        None,
+        &mut |_, _| Some(report()),
+        crate::detail::device_widgets::Lists::default(),
+    );
+    let mut known = std::collections::HashMap::new();
+    known.insert((1, 0.25f64.to_bits()), "-12.0 dB".to_string());
+    let texts = std::sync::Arc::new(std::sync::Mutex::new(known));
+    let mut looked_up = Vec::new();
+    let wanted = detail.follow_automation_texts(&project, 2.0, None, &mut |track, path| {
+        looked_up.push((track, path.to_vec()));
+        Some(std::sync::Arc::clone(&texts))
+    });
+    assert_eq!(looked_up, [(TrackId(1), vec![0])], "looked up once for the device");
+    let Detail::Devices(chain) = &detail else { panic!() };
+    let graph = chain.devices[0].graph.as_ref().unwrap();
+    let shown = |id: &str| graph.parameters.iter().find(|p| p.id == id).map(|p| (p.value, p.text.clone())).unwrap();
+    assert_eq!(shown("1"), (0.25, "-12.0 dB".to_string()), "the plug-in's text for the value played");
+    assert_eq!(shown("5"), (0.25, String::new()), "a quarter of the way along the line, not held at 0");
+    assert_eq!(shown("6"), (0.0, "Shape at 0".to_string()), "a list of choices holds the value it listed");
+    assert_eq!(wanted, [(TrackId(1), vec![0], 5, 0.25)], "the knob's value is asked about");
+    // Between two steps, the knob plays and is asked about on the nearest one.
+    let step = |beat: f64| ((beat / 8.0) * 1024.0).round() / 1024.0;
+    let wanted = detail.follow_automation_texts(&project, 2.01, None, &mut |_, _| Some(std::sync::Arc::clone(&texts)));
+    assert!(wanted.contains(&(TrackId(1), vec![0], 5, step(2.01))), "{wanted:?}");
+    // A value the plug-in named with an empty text shows the number and is not asked about again.
+    texts.lock().unwrap().insert((5, step(2.02).to_bits()), String::new());
+    let wanted = detail.follow_automation_texts(&project, 2.02, None, &mut |_, _| Some(std::sync::Arc::clone(&texts)));
+    assert!(!wanted.iter().any(|(_, _, id, _)| *id == 5), "{wanted:?}");
+    let Detail::Devices(chain) = &detail else { panic!() };
+    let knob = chain.devices[0].graph.as_ref().unwrap().parameters.iter().find(|p| p.id == "5").unwrap();
+    assert_eq!((knob.value, knob.text.as_str()), (step(2.02), ""));
 }
 
 /// A panel showing what automation plays sends nothing by itself, also where the value
@@ -864,6 +970,77 @@ fn a_selected_device_s_outline_runs_along_its_panel_s_edge() {
         assert!(clip.contains_rect(panel), "stacked {stacked}: not cut at the padding box: {clip:?}");
     }
     crate::kit::native_css::set_user_sheet(None);
+}
+
+/// A device group's panel lays out inside its `device` border and padding, in a row and stacked,
+/// as a device's panel does: its header and its rows sit in its content box, the panel grows by
+/// them, and its selection outline still runs along its edge (#1477).
+#[test]
+fn a_group_s_panel_lays_out_inside_its_border_and_padding() {
+    use egui_kittest::Harness;
+    use egui_kittest::kittest::Queryable;
+    use suhina_engine::model::{Branch, Channel, ChannelId, Device, DeviceGroup, Track};
+    let mut project = Project::default();
+    project.tracks.push(Track { channel: Some(ChannelId(1)), ..Track::new(TrackId(1), "T") });
+    let mut channel = Channel::new(ChannelId(1), "T");
+    channel.devices = vec![Device::group("G", DeviceGroup::with_branches(vec![Branch::new("B")]))];
+    project.channels.push(channel);
+    let Detail::Devices(chain) = build(&project, Some(TrackId(1)), None) else { panic!("the track's devices") };
+    let selected = [(TrackId(1), chain.devices[0].at.clone())];
+    let detail = Detail::Devices(chain);
+    let panel_of = |sheet: Option<&str>, stacked: bool| {
+        crate::kit::native_css::set_user_sheet(sheet.map(Into::into));
+        let mut harness = Harness::builder().allow_missing_glyphs().with_size(egui::vec2(600.0, 300.0)).build_ui_state(
+            |ui, actions: &mut Vec<Action>| {
+                let _frame = crate::kit::native_css::frame(ui);
+                let _window = crate::kit::element::WINDOW.enter();
+                let mut places = Vec::new();
+                if stacked {
+                    show_stack(ui, &detail, &selected, actions, &mut places);
+                } else {
+                    show_row(ui, &detail, &selected, actions, &mut places);
+                }
+            },
+            Vec::new(),
+        );
+        harness.run_steps(3);
+        let panel = harness.get_by_label("Device G").rect();
+        let inner: Vec<Rect> = ["Bypass G", "Remove G", "Show branch B", "Add a branch to G"]
+            .into_iter()
+            .map(|label| harness.get_by_label(label).rect())
+            .collect();
+        let outline = harness.output().shapes.iter().find_map(|s| match &s.shape {
+            egui::Shape::Rect(r)
+                if r.stroke.color == crate::kit::theme::studio("selection") && r.stroke.width > 0.0 =>
+            {
+                Some(r.rect)
+            }
+            _ => None,
+        });
+        crate::kit::native_css::set_user_sheet(None);
+        (panel, inner, outline)
+    };
+    for stacked in [false, true] {
+        let (plain, plain_inner, _) = panel_of(None, stacked);
+        let (panel, inner, outline) =
+            panel_of(Some("device[kind=\"group\"] { padding: 10px; border-width: 2px; }"), stacked);
+        let content = panel.shrink(12.0);
+        for rect in &inner {
+            assert!(content.contains_rect(*rect), "stacked {stacked}: {rect:?} inside the content box {content:?}");
+        }
+        // The header's switch and the last row move in by the border and padding.
+        assert_eq!(inner[0].min - plain_inner[0].min, Vec2::splat(12.0), "stacked {stacked}: the switch");
+        assert_eq!(inner[3].left() - plain_inner[3].left(), 12.0, "stacked {stacked}: + Branch");
+        // The panel grows by them: taller stacked, wider in a row (where the row's height is the
+        // tallest panel's or the row's own).
+        if stacked {
+            assert_eq!(panel.height() - plain.height(), 24.0, "stacked: taller by the insets");
+        } else {
+            assert_eq!(panel.width() - plain.width(), 24.0, "row: wider by the insets");
+            assert!(panel.height() >= inner[3].bottom() - panel.top() + 12.0, "row: room for the last row");
+        }
+        assert_eq!(outline, Some(panel), "stacked {stacked}: the outline runs along the panel's edge");
+    }
 }
 
 fn with_plugin() -> Project {
@@ -1978,4 +2155,185 @@ fn the_height_a_padded_panel_asks_for_does_not_outlive_its_frame() {
     ctx.data_mut(|d| d.insert_temp(shown_device_extra_id(), 40.0_f32));
     assert_eq!(shown_device_insets(&ctx, 6.0), 40.0, "the frame after the panel was shown");
     assert_eq!(shown_device_insets(&ctx, 6.0), 6.0, "gone when nothing leaves it again");
+}
+
+/// After a chain's last panel, the slot a dropped effect goes in: as tall as the panels, right of
+/// them, never over one however little room is left, and no hint text in its place
+/// (#1487 L11, B13).
+#[test]
+fn the_slot_after_a_chains_last_device_never_covers_it() {
+    let mut project = demo_project();
+    for _ in 0..2 {
+        project.channels[0].devices.push(Device::new("Utility", DeviceKind::Builtin("utility".into())));
+    }
+    let Detail::Devices(chain) = build(&project, Some(TrackId(1)), None) else { panic!() };
+    let css = "device { background-color: #0000FF; } drop-target[kind=\"append\"] { background-color: #00FF00; }";
+    let draw = |width: f32| {
+        crate::kit::skin::configure(&crate::kit::skin::Skin { css: Some(css.into()), ..Default::default() });
+        let area = Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(width, 300.0));
+        let ctx = egui::Context::default();
+        let mut shapes = Vec::new();
+        for _ in 0..3 {
+            let mut output = ctx.run_ui(Default::default(), |ui| {
+                let _frame = crate::kit::native_css::frame_with_motion(ui, false);
+                let painter = ui.painter().clone();
+                chain_row(ui, &painter, area, &chain, &[], &mut Vec::new(), &mut Vec::new());
+            });
+            output.textures_delta.clear();
+            shapes = output.shapes;
+        }
+        crate::kit::skin::configure(&crate::kit::skin::Skin::default());
+        let fills = |colour: egui::Color32| -> Vec<Rect> {
+            shapes
+                .iter()
+                .filter_map(|s| match &s.shape {
+                    egui::Shape::Rect(r) if r.fill == colour => Some(r.rect),
+                    _ => None,
+                })
+                .collect()
+        };
+        let texts = shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Text(t) if t.galley.text() == APPEND_HINT));
+        (fills(egui::Color32::BLUE), fills(egui::Color32::from_rgb(0, 0xFF, 0)), texts)
+    };
+    let (panels, slots, hint_text) = draw(1400.0);
+    assert_eq!(panels.len(), 2, "{panels:?}");
+    assert_eq!(slots.len(), 1, "{slots:?}");
+    let (last, slot) = (panels[1], slots[0]);
+    assert!(slot.left() > last.right(), "{slot:?} after {last:?}");
+    assert_eq!((slot.top(), slot.height()), (last.top(), last.height()), "as tall as the panels");
+    assert!(!hint_text, "the slot is named, not written over the chain");
+    // Room for the panels and a few points more: the slot is cut at the area's edge, not drawn
+    // back over the last panel.
+    let (panels, slots, _) = draw(last.right() + 8.0);
+    for slot in &slots {
+        assert!(panels.iter().all(|p| !p.intersects(slot.shrink(0.5))), "{slot:?} over {panels:?}");
+    }
+}
+
+/// A compressor reads a key (sidechain): its panel's SC button lists the other tracks, and a
+/// pick runs `device.setKey`; once it reads one, the button names it, and Sidechain to on the
+/// source's menu lists the compressor as keyed from there.
+#[test]
+fn a_compressors_sidechain_button_picks_a_source_track() {
+    use egui_kittest::Harness;
+    use egui_kittest::kittest::Queryable;
+    let mut project = demo_project();
+    let reader = project.track(TrackId(1)).and_then(|t| t.channel).unwrap();
+    project
+        .channel_mut(reader)
+        .unwrap()
+        .devices
+        .push(Device::new("Compressor", DeviceKind::Builtin("compressor".into())));
+    let source_name = project.shown_track_name(TrackId(2));
+    let Detail::Devices(chain) = build(&project, Some(TrackId(1)), None) else { panic!() };
+    let side = chain.devices[0].sidechain.clone().expect("a compressor reads a key");
+    assert_eq!(side.key, None);
+    assert!(side.sources.iter().any(|(t, _)| *t == TrackId(2)), "{:?}", side.sources);
+    assert!(side.sources.iter().all(|(t, _)| *t != TrackId(1)), "not its own track: {:?}", side.sources);
+    let detail = Detail::Devices(chain);
+    let mut harness = Harness::builder().allow_missing_glyphs().with_size(egui::vec2(700.0, 500.0)).build_ui_state(
+        |ui, actions: &mut Vec<Action>| {
+            let mut places = Vec::new();
+            show_row(ui, &detail, &[], actions, &mut places);
+        },
+        Vec::new(),
+    );
+    harness.get_by_label("Compressor sidechain: none").click();
+    harness.run();
+    harness.get_by_label(&source_name).click();
+    harness.run();
+    let set: Vec<_> = harness.state().iter().filter(|a| a.id == "device.setKey").cloned().collect();
+    assert_eq!(set.len(), 1, "{:?}", harness.state());
+    assert_eq!((&set[0].params["track"], &set[0].params["source"]), (&json!(1), &json!(2)));
+
+    // Keyed: the button says from where, and the source's Sidechain to has it ticked.
+    let source = project.track(TrackId(2)).and_then(|t| t.channel).unwrap();
+    project.channel_mut(reader).unwrap().devices[0].inputs =
+        vec![suhina_engine::model::DeviceInput::key(source, suhina_engine::model::TapPoint::PostFader)];
+    let Detail::Devices(chain) = build(&project, Some(TrackId(1)), None) else { panic!() };
+    let key = chain.devices[0].sidechain.as_ref().and_then(|s| s.key.clone()).unwrap();
+    assert_eq!((key.track, key.tap, key.gain_db), (TrackId(2), suhina_engine::model::TapPoint::PostFader, 0.0));
+    let readers = crate::interaction::menus::key_readers(&project);
+    let compressor = readers.iter().find(|r| r.track == TrackId(1)).unwrap();
+    assert_eq!((compressor.device, compressor.source), (0, Some(TrackId(2))));
+    assert!(compressor.refused.contains(&TrackId(1)), "its own track is no source");
+}
+
+/// A device's menu renames it: the name typed in its field, applied with Enter, is one
+/// `device.rename`; Enter on the unchanged name sends nothing.
+#[test]
+fn a_devices_menu_renames_it() {
+    use egui_kittest::Harness;
+    use egui_kittest::kittest::Queryable;
+    let at = crate::detail::detail_view::DeviceAt(vec![2]);
+    let mut harness = Harness::builder().allow_missing_glyphs().with_size(egui::vec2(300.0, 300.0)).build_ui_state(
+        |ui, actions: &mut Vec<Action>| {
+            crate::interaction::menus::device_menu(ui, TrackId(3), &at, None, true, "Utility", None, actions);
+        },
+        Vec::new(),
+    );
+    harness.get_by_label("Rename Utility").click();
+    harness.key_press(egui::Key::Enter);
+    harness.run();
+    assert!(harness.state().iter().all(|a| a.id != "device.rename"), "{:?}", harness.state());
+    harness.get_by_label("Rename Utility").click();
+    harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+    harness.get_by_label("Rename Utility").type_text("Source level");
+    harness.key_press(egui::Key::Enter);
+    harness.run();
+    let renamed: Vec<_> = harness.state().iter().filter(|a| a.id == "device.rename").collect();
+    assert_eq!(renamed.len(), 1, "{:?}", harness.state());
+    assert_eq!(renamed[0].params, json!({ "track": 3, "device": 2, "name": "Source level" }));
+}
+
+/// A track's Sidechain to has a search field over a list that scrolls: typed words keep the
+/// devices whose "Track › Device" has them all, and a pick runs `device.setKey` from this track.
+#[test]
+fn sidechain_to_searches_the_keyed_devices() {
+    use crate::interaction::menus::{KeyReader, TrackMenu, track_menu};
+    use egui_kittest::Harness;
+    use egui_kittest::kittest::Queryable;
+    let readers: Vec<KeyReader> = (0..10)
+        .map(|i| KeyReader {
+            track: TrackId(10 + i),
+            device: 0,
+            label: format!("{} › Compressor", if i == 7 { "Bass".to_string() } else { format!("Pad {i}") }),
+            source: None,
+            refused: vec![TrackId(10 + i)],
+        })
+        .collect();
+    let mut harness = Harness::builder().allow_missing_glyphs().with_size(egui::vec2(700.0, 600.0)).build_ui_state(
+        |ui, actions: &mut Vec<Action>| {
+            let menu = TrackMenu {
+                track: TrackId(1),
+                name: "Kick",
+                colour: suhina_engine::model::Rgb(200, 100, 50),
+                is_group: false,
+                is_return: false,
+                selection: &[],
+                into: &[],
+                out: None,
+                midi: None,
+                audio: None,
+                tracks_copied: false,
+                key_readers: &readers,
+            };
+            track_menu(ui, &menu, actions);
+        },
+        Vec::new(),
+    );
+    harness.run();
+    harness.get_by_label("Sidechain to").click();
+    harness.run();
+    harness.run();
+    assert!(harness.query_by_label("Pad 3 › Compressor").is_some(), "every device is listed");
+    harness.get_by_label("Search devices").type_text("bass");
+    harness.run();
+    harness.run();
+    assert!(harness.query_by_label("Pad 3 › Compressor").is_none(), "the others are filtered out");
+    harness.get_by_label("Bass › Compressor").click();
+    harness.run();
+    let set: Vec<_> = harness.state().iter().filter(|a| a.id == "device.setKey").cloned().collect();
+    assert_eq!(set.len(), 1, "{:?}", harness.state());
+    assert_eq!((&set[0].params["track"], &set[0].params["source"]), (&json!(17), &json!(1)));
 }

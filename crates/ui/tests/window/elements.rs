@@ -165,6 +165,13 @@ fn count_with(h: &mut Harness<'static, App>, css: &str, color: egui::Color32) ->
 #[test]
 fn a_clip_picked_in_its_body_takes_its_own_selected_rule() {
     let mut h = arrangement_app();
+    // The outline is how a clip picked in its body shows with Selection colour › Clip's own
+    // colour; with a selection colour it is filled with it instead.
+    let ctx = h.ctx.clone();
+    let mut settings = h.state().settings().clone();
+    settings.view.selection.mode = suhina_ui::kit::selection::SelectionColour::Own;
+    h.state_mut().set_settings(&ctx, settings);
+    h.run();
     let body = h.get_by_label("Clip Beat B on Drums at bar 17").rect().left_center() + egui::vec2(64.0, 0.0);
     h.hover_at(body);
     h.run();
@@ -474,8 +481,9 @@ fn fills_at(h: &Harness<'static, App>, rect: egui::Rect) -> Vec<egui::Color32> {
     fn walk(shape: &egui::Shape, rect: egui::Rect, found: &mut Vec<egui::Color32>) {
         match shape {
             egui::Shape::Vec(shapes) => shapes.iter().for_each(|shape| walk(shape, rect, found)),
+            // Within a pixel: a box is painted on whole pixels, half a pixel each way at most.
             egui::Shape::Rect(shape)
-                if (shape.rect.min - rect.min).length() < 0.5 && (shape.rect.max - rect.max).length() < 0.5 =>
+                if (shape.rect.min - rect.min).length() <= 1.0 && (shape.rect.max - rect.max).length() <= 1.0 =>
             {
                 found.push(shape.fill)
             }
@@ -1608,7 +1616,7 @@ fn a_built_in_theme_with_a_rule_for_every_button_still_shows_its_lit_buttons() {
         ("suhina-meadow", None, Some(rgb(0x18, 0x2a, 0x44))),
         ("suhina-blocks", None, Some(rgb(0xee, 0xe1, 0xc0))),
         ("suhina-sheet", None, Some(rgb(0x28, 0x5c, 0x3d))),
-        ("suhina-studio", Some(suhina_ui::kit::theme::GLOSS_EXAMPLE), None),
+        ("suhina-studio", Some(include_str!("../fixtures/dark-gloss.css")), None),
     ] {
         let mut h = lit_drums();
         let ctx = h.ctx.clone();
@@ -1673,7 +1681,7 @@ fn a_built_in_theme_with_a_rule_for_every_button_still_shows_the_chosen_monitor_
         ("suhina-meadow", None),
         ("suhina-blocks", None),
         ("suhina-sheet", None),
-        ("suhina-studio", Some(suhina_ui::kit::theme::GLOSS_EXAMPLE)),
+        ("suhina-studio", Some(include_str!("../fixtures/dark-gloss.css"))),
     ] {
         let mut project = demo_project();
         project.tracks[0].content = suhina_engine::model::ContentKinds { notes: false, audio: true };
@@ -1951,7 +1959,7 @@ fn a_built_in_theme_with_a_rule_for_every_button_still_shows_the_chosen_chip() {
         ("suhina-meadow", None),
         ("suhina-blocks", None),
         ("suhina-sheet", None),
-        ("suhina-studio", Some(suhina_ui::kit::theme::GLOSS_EXAMPLE)),
+        ("suhina-studio", Some(include_str!("../fixtures/dark-gloss.css"))),
     ] {
         let mut h = browser_with_chips();
         let ctx = h.ctx.clone();
@@ -2095,7 +2103,7 @@ fn a_built_in_theme_with_a_rule_for_every_button_still_shows_the_chosen_preset()
         ("suhina-meadow", None),
         ("suhina-blocks", None),
         ("suhina-sheet", None),
-        ("suhina-studio", Some(suhina_ui::kit::theme::GLOSS_EXAMPLE)),
+        ("suhina-studio", Some(include_str!("../fixtures/dark-gloss.css"))),
     ] {
         let mut h = settings_on("Keys");
         h.get_by_label("Preset: Mouse-first").click();

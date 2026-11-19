@@ -31,7 +31,18 @@ const PATIENT: Duration = Duration::from_secs(20);
 
 /// A catalog with the host's VST3 test plug-in, as an effect with the id `vst3`: a gain.
 fn env() -> Arc<PluginEnv> {
-    let path = PathBuf::from("test:vst3");
+    env_of("test:vst3")
+}
+
+/// [`env`] with `test:vst3-gate`, the test plug-in whose state reads honour the [`StateGate`]:
+/// its host process is born after the gate is named and is no other test's, so the gate holds its
+/// reads, and only its reads.
+fn gated_env() -> Arc<PluginEnv> {
+    env_of("test:vst3-gate")
+}
+
+fn env_of(spec: &str) -> Arc<PluginEnv> {
+    let path = PathBuf::from(spec);
     let info = PluginInfo {
         path: path.clone(),
         id: "vst3".into(),
@@ -57,6 +68,7 @@ fn project() -> Project {
         release_velocity: 0.5,
         channel: 0,
         muted: false,
+        velocity_range: 0,
     };
     Project {
         tracks: vec![Track {
@@ -76,6 +88,8 @@ fn project() -> Project {
             output: None,
             sends: Vec::new(),
             devices: vec![Device {
+                instrument: false,
+                inputs: Vec::new(),
                 id: Default::default(),
                 name: "Test vst3".into(),
                 kind: DeviceKind::Clap { id: "vst3".into() },
@@ -90,6 +104,7 @@ fn project() -> Project {
             automation: Vec::new(),
         }],
         contents: vec![ClipContent {
+            linked: false,
             id: ContentId(1),
             name: "c".into(),
             length: 4.0,
@@ -128,6 +143,8 @@ fn export_ratio(mut project: Project, plugins: Option<Arc<PluginEnv>>) -> (f32, 
         folder: None,
         trusted: Trusted::default(),
         title: String::new(),
+        // The track's notes play as its sine tones through the plug-in effect.
+        implicit_tones: true,
     };
     let path = std::env::temp_dir().join(format!("suhina-export-plugin-{}.wav", std::process::id()));
     let params = json!({ "path": path.display().to_string() });
@@ -191,6 +208,8 @@ fn an_export_gathers_its_states_over_frames_without_the_window_waiting() {
     opened.fill_track_colours();
     let mut renderer = Renderer::stopped(&opened, &AudioPool::new(), SR, suhina_session::devices()).unwrap();
     let mut session = Session::new(opened.clone());
+    // Its notes play as the track's sine tones (#1384).
+    session.set_implicit_tones(true);
     session.attach_player(Player::new(renderer.controller(), None));
     session.rack_mut().set_env(env());
     let device = json!({ "track": 1, "device": 0 });
@@ -242,6 +261,7 @@ fn a_gather_keeps_the_reads_across_a_project_switch() {
     let gain_bytes = DEFAULT_GAIN.to_le_bytes().to_vec();
     opened.channels[0].devices[0].state = Some(gain_bytes.into());
     let mut projects = suhina_session::Projects::new();
+    projects.set_implicit_tones(true);
     let id =
         projects.add(Session::new(opened.clone()), Some("gain".into())).map_err(|e| e.message().to_string()).unwrap();
     let mut renderer = Renderer::stopped(&opened, &AudioPool::new(), SR, suhina_session::devices()).unwrap();
@@ -330,8 +350,10 @@ fn a_cancelled_gather_starts_nothing_on_a_late_reply() {
     opened.fill_track_colours();
     let mut renderer = Renderer::stopped(&opened, &AudioPool::new(), SR, suhina_session::devices()).unwrap();
     let mut session = Session::new(opened.clone());
+    // Its notes play as the track's sine tones (#1384).
+    session.set_implicit_tones(true);
     session.attach_player(Player::new(renderer.controller(), None));
-    session.rack_mut().set_env(env());
+    session.rack_mut().set_env(gated_env());
     // The gate is known before the plug-in's host process is born, which inherits it.
     let mut gate = StateGate::new();
     let device = json!({ "track": 1, "device": 0 });
@@ -368,8 +390,10 @@ fn a_gather_past_its_deadline_says_which_plug_in_did_not_answer() {
     assert_eq!(opened.assign_ids(), Ok(()));
     let mut renderer = Renderer::stopped(&opened, &AudioPool::new(), SR, suhina_session::devices()).unwrap();
     let mut session = Session::new(opened.clone());
+    // Its notes play as the track's sine tones (#1384).
+    session.set_implicit_tones(true);
     session.attach_player(Player::new(renderer.controller(), None));
-    session.rack_mut().set_env(env());
+    session.rack_mut().set_env(gated_env());
     // The gate is known before the plug-in's host process is born, which inherits it.
     let mut gate = StateGate::new();
     session.sync_plugins();
@@ -403,11 +427,13 @@ fn a_gather_past_its_deadline_says_which_plug_in_did_not_answer() {
     assert!(!session.can_undo());
 }
 
-/// The test plug-in's state-read gate (`SUHINA_TEST_PLUGIN_STATE_GATE`): while it is held, the
-/// plug-in's state reads keep their replies, so a test holds a read out for as long as it
-/// needs, never racing its answer. Hosts inherit the variable at their spawn, so it names one
-/// file for the whole test binary, and the tests that hold it take turns. Dropped, it lets
-/// every read go.
+/// The test plug-in's state-read gate (`SUHINA_TEST_PLUGIN_STATE_GATE`): while it is held,
+/// `test:vst3-gate`'s state reads keep their replies, so a test holds a read out for as long as
+/// it needs, never racing its answer. Only that plug-in honours it, in a host of its own that
+/// only the tests holding the gate start ([`gated_env`]): a plain `test:vst3` host another test
+/// started before the variable was named would never see it, and the other tests' reads are
+/// never held. Hosts inherit the variable at their spawn, so it names one file for the whole
+/// test binary, and the tests that hold it take turns. Dropped, it lets every read go.
 struct StateGate {
     path: PathBuf,
     _turn: std::sync::MutexGuard<'static, ()>,
@@ -469,6 +495,8 @@ fn an_export_plays_the_running_plug_ins_state_without_a_project_change() {
     assert!(peak(&dry) > 0.1, "the notes sound: {}", peak(&dry));
     let mut renderer = Renderer::stopped(&opened, &AudioPool::new(), SR, suhina_session::devices()).unwrap();
     let mut session = Session::new(opened.clone());
+    // Its notes play as the track's sine tones (#1384).
+    session.set_implicit_tones(true);
     session.attach_player(Player::new(renderer.controller(), None));
     session.rack_mut().set_env(env());
     let device = json!({ "track": 1, "device": 0 });
@@ -531,6 +559,8 @@ fn a_rack_limited_to_one_device_starts_only_it_and_reads_its_state_now() {
     assert_eq!(keys.len(), 2);
     let mut renderer = Renderer::stopped(&project, &AudioPool::new(), SR, suhina_session::devices()).unwrap();
     let mut session = Session::new(project);
+    // Its notes play as the track's sine tones (#1384).
+    session.set_implicit_tones(true);
     session.attach_player(Player::new(renderer.controller(), None));
     session.rack_mut().set_env(env());
     session.rack_mut().only(Some(keys[1]));

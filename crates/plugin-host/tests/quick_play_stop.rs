@@ -52,9 +52,11 @@ fn project(tracks: u32) -> Project {
         release_velocity: 0.5,
         channel: 0,
         muted: false,
+        velocity_range: 0,
     }];
     let mut p = Project {
         contents: vec![ClipContent {
+            linked: false,
             id: ContentId(1),
             name: "c".into(),
             length: 64.0,
@@ -66,6 +68,7 @@ fn project(tracks: u32) -> Project {
     };
     for id in 1..=tracks {
         p.tracks.push(Track {
+            folder: false,
             id: TrackId(id),
             name: format!("Synth {id}"),
             color: None,
@@ -88,6 +91,8 @@ fn project(tracks: u32) -> Project {
             output: None,
             sends: Vec::new(),
             devices: vec![Device {
+                instrument: false,
+                inputs: Vec::new(),
                 id: Default::default(),
                 name: "Synth".into(),
                 kind: DeviceKind::Clap { id: "x".into() },

@@ -84,8 +84,17 @@ pub(crate) struct Chain {
     /// device.
     params: Vec<Vec<f64>>,
     pub(crate) instrument: bool,
+    /// Its instrument is the sine tones the chain adds itself after MIDI effects, the track having
+    /// no instrument of its own: heard only while the renderer plays the implicit tones (#1384).
+    pub(crate) implicit_tones: bool,
+    /// The renderer does not play the implicit tones now: such a chain takes no notes.
+    pub(crate) tones_off: bool,
     /// The delay its devices add together, in frames.
     pub(crate) latency: u32,
+    /// How late the sound coming into it is, in frames: 0 for a track's own sources, the latest
+    /// of the chains that feed a bus or a return (set with the latency compensation). Its
+    /// plug-ins are told the song position of the sound they get ([`PluginSlot::song_delay`]).
+    pub(crate) input_latency: u32,
     /// Latency compensation: delays the chain's output so that it lines up with the chain with
     /// the most latency (set by the graph once every chain is built).
     pub(crate) delay: Delay,
@@ -116,6 +125,9 @@ pub(crate) struct Chain {
     /// When in a block it runs: after the chains that play into it (#1261), and with how much
     /// of the deadline (see [`crate::sends::Turn`]).
     pub(crate) turn: crate::sends::Turn,
+    /// Blocks it came back from a render worker after their deadline (ADR 0038 › 3): what
+    /// waiting for it cost, counted for its track.
+    pub(crate) missed_blocks: u64,
     /// What it adds to its bus or the output and to the cue bus, staged when it is done
     /// ([`Chain::stage`]) and added in chain order, so a sum never depends on which plug-in
     /// answered first.
@@ -171,6 +183,57 @@ pub(crate) struct Chain {
     /// (ADR 0033 › 2, #990): what scales the host's
     /// output frame by frame and the other clips' sound, added after it.
     pub(crate) ara: Option<AraHost>,
+    /// The keys (sidechains) its devices read, each from a chain's tap point
+    /// (`docs/spec/sidechain.md` › Engine); empty for almost every chain.
+    pub(crate) key_reads: Vec<KeyRead>,
+    /// The chains that read a key from this one: each waits for it in a block.
+    pub(crate) key_readers: Vec<usize>,
+    /// Its signal at each tap point another chain reads ([`tap_index`]): empty unless read,
+    /// else `MAX_BLOCK` frames of interleaved stereo, filled as the block runs.
+    pub(crate) taps: [Vec<f32>; 3],
+}
+
+/// A key a slot of a chain reads (`docs/spec/sidechain.md` › Engine): the slot, the chain it
+/// reads and at which tap point, its gain, the delay that lines it up with the reader's own input,
+/// and the block's key after both. Made with the graph; never allocates on the audio thread.
+pub(crate) struct KeyRead {
+    pub(crate) slot: usize,
+    pub(crate) source: usize,
+    pub(crate) tap: suhina_model::TapPoint,
+    pub(crate) gain: f32,
+    pub(crate) delay: Delay,
+    pub(crate) buffer: Vec<f32>,
+}
+
+impl KeyRead {
+    pub(crate) fn new(slot: usize, source: usize, tap: suhina_model::TapPoint, gain: f32, delay: usize) -> Self {
+        Self { slot, source, tap, gain, delay: Delay::new(delay), buffer: vec![0.0; MAX_BLOCK * 2] }
+    }
+
+    /// Takes the block's key from `source` (the tap point's frames): delayed, then at its gain.
+    pub(crate) fn take(&mut self, source: &[f32], frames: usize) {
+        let end = (frames.min(MAX_BLOCK) * 2).min(self.buffer.len());
+        let Some(buffer) = self.buffer.get_mut(..end) else { return };
+        match source.get(..end) {
+            Some(source) => buffer.copy_from_slice(source),
+            None => buffer.fill(0.0),
+        }
+        self.delay.run(buffer);
+        if self.gain != 1.0 {
+            for sample in buffer.iter_mut() {
+                *sample *= self.gain;
+            }
+        }
+    }
+}
+
+/// Where a tap point's signal is kept in [`Chain::taps`].
+pub(crate) fn tap_index(tap: suhina_model::TapPoint) -> usize {
+    match tap {
+        suhina_model::TapPoint::PreFx => 0,
+        suhina_model::TapPoint::PostFx => 1,
+        suhina_model::TapPoint::PostFader => 2,
+    }
 }
 
 /// A chain's clip host's buffers (#990): `env`, the gains its output takes frame by frame (the
@@ -297,8 +360,11 @@ impl Chain {
             let Some(built) = factory.device(stored, 0, &[position], (&mut device_lanes, slots.len())) else {
                 continue;
             };
+            let mut slot = built.slot;
+            // What the devices before it delay: its plug-ins are told the song that late.
+            set_song_delay(&mut slot, latency);
             latency = latency.saturating_add(built.latency);
-            slots.push(built.slot);
+            slots.push(slot);
             positions.push(position);
             ids.push(built.id);
             device_ids.push(stored.id);
@@ -309,6 +375,7 @@ impl Chain {
         // MIDI effects with no instrument after them play the notes they change as the sine
         // tones the track would play without them (ADR 0004 › 14).
         let is_midi = |slot: &DeviceSlot| matches!(slot, DeviceSlot::MidiDevice(_));
+        let mut implicit_tones = false;
         if !instrument && slots.iter().any(is_midi) {
             let at = slots.iter().take_while(|slot| is_midi(slot)).count();
             device_lanes.insert_slot(at);
@@ -318,6 +385,7 @@ impl Chain {
             device_ids.insert(at, DeviceId::NONE);
             params.insert(at, Vec::new());
             instrument = true;
+            implicit_tones = true;
         }
         // The channel's clip host plays the ARA clips (#990): only while it is enabled and running
         // as the first slot; otherwise the clips play as they are.
@@ -345,7 +413,10 @@ impl Chain {
             device_ids,
             params,
             instrument,
+            implicit_tones,
+            tones_off: false,
             latency,
+            input_latency: 0,
             delay: Delay::new(0),
             post: (post.0 / CHAIN_INPUT_GAIN, post.1 / CHAIN_INPUT_GAIN),
             device_lanes,
@@ -362,6 +433,7 @@ impl Chain {
             span_events: Vec::with_capacity(MAX_PENDING * 2),
             midi_scratch: Vec::with_capacity(MAX_PENDING * 2),
             deadline: None,
+            missed_blocks: 0,
             context: ProcessContext::default(),
             sample_rate: f64::from(sample_rate),
             done: 0,
@@ -380,6 +452,9 @@ impl Chain {
             built_pan: None,
             pan: (LiveVolume::default(), LiveVolume::default()),
             live: LiveVolume::default(),
+            key_reads: Vec::new(),
+            key_readers: Vec::new(),
+            taps: Default::default(),
         })
     }
 
@@ -399,7 +474,10 @@ impl Chain {
             sample_edits: Vec::new(),
             params: Vec::new(),
             instrument: false,
+            implicit_tones: false,
+            tones_off: false,
             latency: 0,
+            input_latency: 0,
             delay: Delay::new(0),
             post: (1.0, 1.0),
             device_lanes: DeviceLanes::none(),
@@ -416,6 +494,7 @@ impl Chain {
             span_events: Vec::new(),
             midi_scratch: Vec::new(),
             deadline: None,
+            missed_blocks: 0,
             context: ProcessContext::default(),
             // No devices read it; the live volume's smoothing does.
             sample_rate: f64::from(sample_rate),
@@ -435,6 +514,9 @@ impl Chain {
             built_pan: None,
             pan: (LiveVolume::default(), LiveVolume::default()),
             live: LiveVolume::default(),
+            key_reads: Vec::new(),
+            key_readers: Vec::new(),
+            taps: Default::default(),
         }
     }
 
@@ -502,6 +584,73 @@ impl Chain {
     /// `deadline` (`None` offline). Events queued since the last block stay, at frame 0: a jump
     /// or a stop releases notes before the block begins, while `done` still counts the previous
     /// block, and a release left at that frame would come after the notes the new block starts.
+    /// The slot of the device at `position` among the channel's top-level devices, if it runs.
+    pub(crate) fn slot_of(&self, position: usize) -> Option<usize> {
+        self.positions.iter().position(|&p| p == position)
+    }
+
+    /// Marks the plug-in at `slot` as one that reads a key, from the graph's first block: it then
+    /// runs its blocks on its own, never in a joint round trip, where only the leader is handed
+    /// its key and a keyed plug-in following another would hear none.
+    pub(crate) fn mark_keyed(&mut self, slot: usize) {
+        if let Some(DeviceSlot::Plugin(plugin)) = self.slots.get_mut(slot) {
+            plugin.keyed = true;
+        }
+    }
+
+    /// Keeps the chain's signal at `tap` each block, for a key another chain reads. Allocates.
+    pub(crate) fn want_tap(&mut self, tap: suhina_model::TapPoint) {
+        if let Some(buffer) = self.taps.get_mut(tap_index(tap))
+            && buffer.is_empty()
+        {
+            *buffer = vec![0.0; MAX_BLOCK * 2];
+        }
+    }
+
+    /// The block's signal at `tap`, as far as it has been kept (empty when nothing reads it).
+    pub(crate) fn tap(&self, tap: suhina_model::TapPoint, frames: usize) -> &[f32] {
+        let buffer = self.taps.get(tap_index(tap)).map_or(&[][..], Vec::as_slice);
+        buffer.get(..(frames.min(MAX_BLOCK) * 2).min(buffer.len())).unwrap_or_default()
+    }
+
+    /// Keeps the block's signal before its devices (`PreFx`), when a key reads it: call it once
+    /// its sources and its feeders' sound are in, before its devices run. Never allocates.
+    pub(crate) fn keep_pre_fx(&mut self, frames: usize) {
+        let end = frames.min(MAX_BLOCK) * 2;
+        if let (Some(tap), Some(buffer)) =
+            (self.taps.get_mut(tap_index(suhina_model::TapPoint::PreFx)), self.buffer.get(..end))
+            && let Some(tap) = tap.get_mut(..end)
+        {
+            tap.copy_from_slice(buffer);
+        }
+    }
+
+    /// Keeps the block's signal after its devices (`PostFx`) and after its fader, mute and pan
+    /// (`PostFader`), when a key reads them: call it once its devices have run the block, before
+    /// [`Chain::mix`] delays the buffer. Never allocates.
+    pub(crate) fn keep_post(&mut self, frames: usize) {
+        let end = frames.min(MAX_BLOCK) * 2;
+        let Some(buffer) = self.buffer.get(..end) else { return };
+        if let Some(tap) = self.taps.get_mut(tap_index(suhina_model::TapPoint::PostFx)).and_then(|t| t.get_mut(..end)) {
+            tap.copy_from_slice(buffer);
+        }
+        let (gain_left, gain_right) = self.post;
+        let (live, pan) = (self.live, self.pan);
+        let mix = &self.mix;
+        if let Some(tap) =
+            self.taps.get_mut(tap_index(suhina_model::TapPoint::PostFader)).and_then(|t| t.get_mut(..end))
+        {
+            for (frame, ([l, r], [bl, br])) in
+                tap.as_chunks_mut::<2>().0.iter_mut().zip(buffer.as_chunks::<2>().0).enumerate()
+            {
+                let (lane_left, lane_right) = mix.as_ref().map_or((1.0, 1.0), |m| m.gains(frame));
+                let fader = live.at(frame);
+                *l = bl * gain_left * lane_left * fader * pan.0.at(frame);
+                *r = br * gain_right * lane_right * fader * pan.1.at(frame);
+            }
+        }
+    }
+
     pub(crate) fn begin(&mut self, frames: usize, deadline: Option<Instant>) {
         if let Some(buffer) = self.buffer.get_mut(..frames.min(MAX_BLOCK) * 2) {
             buffer.fill(0.0);
@@ -526,20 +675,23 @@ impl Chain {
         self.deadline = deadline;
     }
 
-    /// Plans the parameter events of its plug-ins for a block of `frames` frames starting at
-    /// arrangement frame `time` (`None` while the transport is stopped, standing at `parked`,
-    /// where the plug-ins' lanes send their values once): call it after
-    /// [`Chain::begin`], before any of the block runs. Never allocates.
     /// Tells the chain's plug-ins where the song is as the block starts
-    /// ([`PluginProcessor::transport`]). Never allocates.
-    pub(crate) fn transport(&mut self, song: &crate::plugin::SongPosition) {
+    /// ([`PluginProcessor::transport`]): each the song of the sound it hears, as late as the
+    /// chain's input and the devices before it, read from the blocks played
+    /// ([`crate::plugin::SongHistory`]). Never allocates.
+    pub(crate) fn transport(&mut self, songs: &crate::plugin::SongHistory) {
+        let input = self.input_latency;
         for slot in self.plugin_slots() {
             if let Some(processor) = slot.processor.as_mut() {
-                processor.transport(song);
+                processor.transport(&songs.heard(input.saturating_add(slot.song_delay)));
             }
         }
     }
 
+    /// Plans the parameter events of its plug-ins for a block of `frames` frames starting at
+    /// arrangement frame `time` (`None` while the transport is stopped, standing at `parked`,
+    /// where the plug-ins' lanes send their values once): call it after
+    /// [`Chain::begin`], before any of the block runs. Never allocates.
     pub(crate) fn automate(&mut self, time: Option<u64>, parked: u64, frames: usize) {
         let frames = frames.min(MAX_BLOCK);
         for slot in self.plugin_slots() {
@@ -599,14 +751,19 @@ impl Chain {
             caught_up,
             positions,
             ara,
+            key_reads,
             ..
         } = self;
         let from = (*done).min(to);
         let alone = ara.is_some();
-        while let Some(slot) = slots.get_mut(*stage) {
+        while *stage < slots.len() {
+            let notes_ended = notes_ended(slots, *stage);
+            let Some(slot) = slots.get_mut(*stage) else { break };
+            let key = key_reads.iter().find(|k| k.slot == *stage).map(|k| k.buffer.as_slice());
             match slot {
                 DeviceSlot::Device(device) => {
-                    run_device(device, *stage, buffer, from, to, pending, device_lanes, context, *sample_rate);
+                    let run = (from, to, *sample_rate);
+                    run_device_keyed(device, *stage, buffer, run, pending, device_lanes, context, key);
                     // The analyser hears the device's output, so its line shows what the
                     // device made of the sound (docs/spec/eq.md › The panel › The analyser).
                     // The watch is keyed by the device's position in the project, not its
@@ -646,12 +803,18 @@ impl Chain {
                     }
                     let last = (to - from).saturating_sub(1);
                     span_events.clear();
-                    span_events.extend(pending.iter().map(|&(at, event)| (at.saturating_sub(from).min(last), event)));
+                    if !notes_ended {
+                        span_events
+                            .extend(pending.iter().map(|&(at, event)| (at.saturating_sub(from).min(last), event)));
+                    }
                     let Some(span) = buffer.get_mut(from * 2..to * 2) else {
                         *stage += 1;
                         continue;
                     };
                     let host = alone && *stage == 0;
+                    if let (Some(key), Some(DeviceSlot::Plugin(plugin))) = (key, slots.get_mut(*stage)) {
+                        plugin.set_key(key.get(from * 2..to * 2).unwrap_or_default());
+                    }
                     let (sent, next) =
                         send_plugins(slots, *stage, (from, to), span, span_events, *deadline, joined, host);
                     match sent {
@@ -716,6 +879,11 @@ impl Chain {
             Some(DeviceSlot::Plugin(plugin)) => plugin.watch(self.behind == Some(index)),
             _ => None,
         }
+    }
+
+    /// Whether `now` is past this block's deadline (never offline, where there is none).
+    pub(crate) fn past_deadline(&self, now: Instant) -> bool {
+        self.deadline.is_some_and(|deadline| now > deadline)
     }
 
     /// Until when the block out may take: the block's deadline, or offline, where there is
@@ -981,15 +1149,20 @@ impl Chain {
             joined,
             positions,
             ara,
+            key_reads,
             ..
         } = self;
         let from = (*done).min(to);
         let alone = ara.is_some();
         let mut index = 0;
-        while let Some(slot) = slots.get_mut(index) {
+        while index < slots.len() {
+            let notes_ended = notes_ended(slots, index);
+            let Some(slot) = slots.get_mut(index) else { break };
+            let key = key_reads.iter().find(|k| k.slot == index).map(|k| k.buffer.as_slice());
             match slot {
                 DeviceSlot::Device(device) => {
-                    run_device(device, index, buffer, from, to, pending, device_lanes, context, *sample_rate);
+                    let run = (from, to, *sample_rate);
+                    run_device_keyed(device, index, buffer, run, pending, device_lanes, context, key);
                     // The watch is keyed by the device's position in the project: `build`
                     // omits a disabled device, and a slot index would shift the row. `get`,
                     // not an index: a slot without a position skips its capture, and the
@@ -1027,12 +1200,18 @@ impl Chain {
                     }
                     let last = (to - from).saturating_sub(1);
                     span_events.clear();
-                    span_events.extend(pending.iter().map(|&(at, event)| (at.saturating_sub(from).min(last), event)));
+                    if !notes_ended {
+                        span_events
+                            .extend(pending.iter().map(|&(at, event)| (at.saturating_sub(from).min(last), event)));
+                    }
                     let Some(span) = buffer.get_mut(from * 2..to * 2) else {
                         index += 1;
                         continue;
                     };
                     let host = alone && index == 0;
+                    if let (Some(key), Some(DeviceSlot::Plugin(plugin))) = (key, slots.get_mut(index)) {
+                        plugin.set_key(key.get(from * 2..to * 2).unwrap_or_default());
+                    }
                     let (sent, next) =
                         send_plugins(slots, index, (from, to), span, span_events, *deadline, joined, host);
                     index = match sent {
@@ -1171,6 +1350,8 @@ impl Chain {
         if old.track != self.track {
             return false;
         }
+        // The track's late render blocks are its own, whatever its devices (ADR 0038 › 3).
+        self.missed_blocks = old.missed_blocks;
         // The same kinds alone is not enough: two identical devices that traded places would
         // each keep the other's running state.
         if old.ids == self.ids && old.device_ids == self.device_ids {
@@ -1340,6 +1521,11 @@ impl Joined {
 /// its own and ends the run (a follower gets them at its own turn): a joint block carries one
 /// event list, the first plug-in's, which every plug-in in it is given, so parameter values of
 /// one plug-in would reach the others too, or not reach a follower at all.
+///
+/// For the same reason a plug-in told another song than the first one ends the run: the song
+/// travels in that event list, so a follower after a plug-in with latency would hear the first
+/// one's song, not the song of the sound it gets ([`PluginSlot::song_delay`]). Plug-ins with no
+/// latency between them hear the same song and still share the round trip.
 fn find_joined(
     slots: &mut [DeviceSlot],
     at: usize,
@@ -1348,10 +1534,10 @@ fn find_joined(
     members: &mut [u32; MAX_JOINED],
 ) {
     joined.len = 0;
-    let Some(lead) = (match slots.get_mut(at) {
+    let Some((lead, song_delay)) = (match slots.get_mut(at) {
         Some(DeviceSlot::Plugin(first)) => {
             let automated = first.automate(from, to);
-            first.joint().filter(|_| !automated)
+            first.joint().filter(|_| !automated).map(|joint| (joint, first.song_delay))
         }
         _ => None,
     }) else {
@@ -1362,7 +1548,7 @@ fn find_joined(
         if !plugin.enabled {
             continue;
         }
-        if plugin.has_params(from, to) {
+        if plugin.has_params(from, to) || plugin.song_delay != song_delay {
             break;
         }
         let Some(joint) = plugin.joint().filter(|j| j.process == lead.process) else { break };
@@ -1374,6 +1560,16 @@ fn find_joined(
         *member = joint.member;
         joined.len += 1;
     }
+}
+
+/// Whether the plug-in effect at `at` comes after an instrument: the track's notes end at the
+/// instrument, and a plug-in effect after it (one with a MIDI input, such as a compressor MIDI
+/// notes can trigger) gets none, as an effect on a mixer channel gets none of the notes its
+/// instrument plays; another instrument after it still plays them
+/// (`docs/spec/device-chains.md` › Instruments and their notes).
+pub(crate) fn notes_ended(slots: &[DeviceSlot], at: usize) -> bool {
+    let effect = slots.get(at).is_some_and(|s| matches!(s, DeviceSlot::Plugin(p) if !p.instrument));
+    effect && slots.get(..at).is_some_and(|before| before.iter().any(crate::group::is_instrument))
 }
 
 /// Hands `span` (the block's frames `from..to`) with `events` to the plug-in at `at`, together
@@ -1476,10 +1672,26 @@ pub(crate) fn run_device(
     context: &ProcessContext,
     sample_rate: f64,
 ) {
+    run_device_keyed(device, slot, buffer, (from, to, sample_rate), pending, lanes, context, None);
+}
+
+/// [`run_device`] for a device that reads `key` (sidechain), the block's frames of it, when it
+/// has one: each span hands the device the same frames of the key.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_device_keyed(
+    device: &mut Box<dyn Device>,
+    slot: usize,
+    buffer: &mut [f32],
+    (from, to, sample_rate): (usize, usize, f64),
+    pending: &[(usize, NoteEvent)],
+    lanes: &DeviceLanes,
+    context: &ProcessContext,
+    key: Option<&[f32]>,
+) {
     // Give context-dependent instruments the tempo before an event at frame zero.
     device.set_context(context);
     let run_span = |device: &mut Box<dyn Device>, buffer: &mut [f32], from: usize, to: usize| {
-        process(device, buffer, from, to, &span_context(context, from, sample_rate));
+        process(device, buffer, from, to, &span_context(context, from, sample_rate), key);
     };
     let mut at_done = from;
     let mut changes = lanes.changes(slot, from, to).peekable();
@@ -1576,6 +1788,22 @@ fn midi_span(
     }
 }
 
+/// Tells the plug-ins of `slot` (itself, or every one inside a group) that the devices before it
+/// delay their sound by `before` more frames. Added to what each already has: a plug-in inside a
+/// group was told the devices before it in its branch as the group was built
+/// (`SlotFactory::group`), and the group's own place adds the devices before the group.
+pub(crate) fn set_song_delay(slot: &mut DeviceSlot, before: u32) {
+    match slot {
+        DeviceSlot::Plugin(plugin) => plugin.song_delay = plugin.song_delay.saturating_add(before),
+        DeviceSlot::Group(_) => {
+            for plugin in crate::group::PluginSlots::new(std::slice::from_mut(slot)) {
+                plugin.song_delay = plugin.song_delay.saturating_add(before);
+            }
+        }
+        DeviceSlot::Device(_) | DeviceSlot::MidiDevice(_) => {}
+    }
+}
+
 fn span_context(context: &ProcessContext, frame: usize, sample_rate: f64) -> ProcessContext {
     let mut context = *context;
     if context.playing {
@@ -1584,12 +1812,22 @@ fn span_context(context: &ProcessContext, frame: usize, sample_rate: f64) -> Pro
     context
 }
 
-fn process(device: &mut Box<dyn Device>, buffer: &mut [f32], from: usize, to: usize, context: &ProcessContext) {
+fn process(
+    device: &mut Box<dyn Device>,
+    buffer: &mut [f32],
+    from: usize,
+    to: usize,
+    context: &ProcessContext,
+    key: Option<&[f32]>,
+) {
     if to <= from {
         return;
     }
     let Some(span) = buffer.get_mut(from * 2..to * 2) else { return };
-    device.process(context, span);
+    match key.and_then(|key| key.get(from * 2..to * 2)) {
+        Some(key) => device.process_keyed(context, key, span),
+        None => device.process(context, span),
+    }
 }
 
 /// A live fader factor over one block: from `from` at its first frame to `to` at its last, the

@@ -18,6 +18,11 @@
 //! host's component handler, as a user turning a knob would. Modelled on the `vst3` crate's gain
 //! example (MIT/Apache-2.0).
 //!
+//! `test:vst3-gate` is the same plug-in, the only one whose state reads honour the tests' state-read
+//! gate (`SUHINA_TEST_PLUGIN_STATE_GATE`): a test that holds reads uses it, in a host process of its
+//! own, so no other test's plug-in, in a host that was running before the gate was named, is held
+//! or misses the gate.
+//!
 //! `test:vst3-mix` is the same plug-in, except that its first output channel is the mean of the
 //! first two, so it shows whether its second input was filled.
 
@@ -41,7 +46,8 @@ fn latency_frames(value: f64) -> u32 {
     (value.clamp(0.0, 1.0) * f64::from(MAX_LATENCY)).round() as u32
 }
 
-const PROCESSOR_CID: TUID = uid(0x4C6F6F70, 0x7765726B, 0x54657374, 0x47616931);
+// The SDK-derived class id of the Gain predecessor, for indexed-state tests.
+const PROCESSOR_CID: TUID = uid(0x56535447, 0x61696E67, 0x61696E00, 0x00000000);
 const CONTROLLER_CID: TUID = uid(0x4C6F6F70, 0x7765726B, 0x54657374, 0x43746C31);
 /// The id of its gain parameter.
 const GAIN_PARAMETER: u32 = 0;
@@ -64,6 +70,8 @@ struct Processor {
     latency: AtomicU32,
     /// Whether the first output channel is the mean of the first two (`test:vst3-mix`).
     mix: bool,
+    /// Whether its state reads honour the tests' state-read gate (`test:vst3-gate`).
+    gate: bool,
 }
 
 impl Class for Processor {
@@ -130,6 +138,21 @@ impl IComponentTrait for Processor {
                 Some([a, b, c, d]) => f32::from_le_bytes([*a, *b, *c, *d]),
                 _ => return kResultFalse,
             },
+            // Our version 99 fixture migrates a value using a different parameter law.
+            program if program.get(8..12) == Some(b"FxCk") && program.get(20..24) == Some(&99u32.to_be_bytes()) => {
+                let Some(bytes) = program.get(56..60).and_then(|b| <[u8; 4]>::try_from(b).ok()) else {
+                    return kResultFalse;
+                };
+                1.0 - f32::from_be_bytes(bytes)
+            }
+            // Version 98 of the predecessor's bank: answered yes and not read, as a measured
+            // effect does with a parameter bank, so the host has to set its values by number.
+            bank if bank.starts_with(b"CcnK")
+                && bank.get(8..12) == Some(b"FxBk")
+                && bank.get(20..24) == Some(&98u32.to_be_bytes()) =>
+            {
+                return kResultOk;
+            }
             // As a plug-in seen in #1167 does: a single program's chunk is answered yes and read
             // not at all, so only the host can tell the caller it did not take.
             program if program.starts_with(b"CcnK") && program.get(8..12) == Some(b"FPCh") => return kResultOk,
@@ -148,7 +171,7 @@ impl IComponentTrait for Processor {
         // can keep a read out over a deadline or a cancel for exactly as long as it needs,
         // whatever the machine's load, and let it go by removing the file. A forgotten gate
         // holds a read ten seconds at most.
-        if let Some(gate) = std::env::var_os("SUHINA_TEST_PLUGIN_STATE_GATE") {
+        if let Some(gate) = std::env::var_os("SUHINA_TEST_PLUGIN_STATE_GATE").filter(|_| self.gate) {
             let gate = std::path::Path::new(&gate);
             let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
             while gate.exists() && std::time::Instant::now() < until {
@@ -206,6 +229,23 @@ impl IAudioProcessorTrait for Processor {
     unsafe fn process(&self, data: *mut ProcessData) -> tresult {
         // SAFETY: the host passes its process data for the call.
         let Some(data) = (unsafe { data.as_ref() }) else { return kInvalidArgument };
+        if data.numInputs == 0 && data.numOutputs > 0 {
+            if !data.inputs.is_null() || data.outputs.is_null() {
+                return kInvalidArgument;
+            }
+            // SAFETY: the host supplies the output bus and its channel pointer array.
+            let output = unsafe { &*data.outputs };
+            // SAFETY: the host selected 32-bit samples.
+            let targets = unsafe { output.__field0.channelBuffers32 };
+            for channel in 0..output.numChannels.max(0) as usize {
+                // SAFETY: the bus has numChannels pointers, each covering numSamples frames.
+                let target = unsafe { *targets.wrapping_add(channel) };
+                // SAFETY: the host owns this writable channel for the processing call.
+                let samples = unsafe { std::slice::from_raw_parts_mut(target, data.numSamples.max(0) as usize) };
+                samples.fill(0.5);
+            }
+            return kResultOk;
+        }
         if data.numInputs < 1 || data.numOutputs < 1 {
             return kResultOk;
         }
@@ -581,6 +621,8 @@ impl IPlugViewTrait for View {
 struct Factory {
     /// Whether it makes `test:vst3-mix`'s processor.
     mix: bool,
+    /// Whether it makes `test:vst3-gate`'s processor.
+    gate: bool,
 }
 
 impl Class for Factory {
@@ -623,6 +665,7 @@ impl IPluginFactoryTrait for Factory {
                 gain: Arc::new(AtomicU32::new(0.5f32.to_bits())),
                 latency: AtomicU32::new(LATENCY),
                 mix: self.mix,
+                gate: self.gate,
             })
             .to_com_ptr::<FUnknown>(),
             CONTROLLER_CID => ComWrapper::new(Controller::default()).to_com_ptr::<FUnknown>(),
@@ -657,7 +700,8 @@ impl IPluginFactory2Trait for Factory {
     }
 }
 
-/// The factory, as a module's `GetPluginFactory` would give it; with `mix`, `test:vst3-mix`'s.
-pub(crate) fn factory(mix: bool) -> Option<ComPtr<IPluginFactory>> {
-    ComWrapper::new(Factory { mix }).to_com_ptr::<IPluginFactory>()
+/// The factory, as a module's `GetPluginFactory` would give it; with `mix`, `test:vst3-mix`'s, with
+/// `gate`, `test:vst3-gate`'s.
+pub(crate) fn factory(mix: bool, gate: bool) -> Option<ComPtr<IPluginFactory>> {
+    ComWrapper::new(Factory { mix, gate }).to_com_ptr::<IPluginFactory>()
 }

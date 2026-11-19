@@ -230,6 +230,43 @@ pub(super) const FIELDS: &[Field] = &[
             parse_window_rect(v).map(|rect| s.map_window_rect = Some(rect)).is_some()
         },
     },
+    Field {
+        key: "plugin_manager_columns",
+        write: |s| s.plugin_manager_columns.iter().map(u32::to_string).collect::<Vec<_>>().join(", "),
+        read: |s, v| {
+            let widths: Option<Vec<u32>> = v
+                .split(',')
+                .map(str::trim)
+                .filter(|w| !w.is_empty())
+                // 0 is a column at its width at first (the file's, which fills the rest).
+                .map(|w| {
+                    w.parse::<u32>().ok().map(|w| if w == 0 { 0 } else { w.clamp(MANAGER_COLUMN.0, MANAGER_COLUMN.1) })
+                })
+                .collect();
+            // A list longer than the table's columns is from no version of Suhina: ignored.
+            widths.filter(|w| w.len() <= MANAGER_COLUMNS).map(|w| s.plugin_manager_columns = w).is_some()
+        },
+    },
+    switch!("plugin_manager_owned_first", plugin_manager_owned_first),
+    Field {
+        key: "plugin_manager_hidden",
+        write: |s| s.plugin_manager_hidden.join(", "),
+        read: |s, v| {
+            // Only the headings that can be hidden, each once; anything else is from no version
+            // of Suhina and left out.
+            let mut hidden: Vec<String> = Vec::new();
+            for heading in v.split(',').map(str::trim) {
+                if let Some(known) =
+                    crate::settings::plugin_manager::hideable_headings().find(|h| h.eq_ignore_ascii_case(heading))
+                    && !hidden.iter().any(|h| h == known)
+                {
+                    hidden.push(known.to_string());
+                }
+            }
+            s.plugin_manager_hidden = hidden;
+            true
+        },
+    },
     text!("audio_host", audio_host),
     text!("audio_device", audio_device),
     number!("audio_sample_rate", audio_sample_rate, u32, only |r: &u32| *r <= MAX_SAMPLE_RATE),
@@ -238,6 +275,7 @@ pub(super) const FIELDS: &[Field] = &[
     switch!("audio_exclusive", audio_exclusive),
     number!("audio_cue_pair", audio_cue_pair, u16, only |p: &u16| *p <= MAX_CUE_PAIR),
     number!("audio_cue_volume", audio_cue_volume, i32, clamp CUE_VOLUMES),
+    number!("render_threads", render_threads, u32, only |n: &u32| RENDER_THREAD_CHOICES.contains(n)),
     Field {
         key: "audio_input",
         write: |s| s.audio_input.clone(),
@@ -292,8 +330,11 @@ pub(super) const LATER: &[Field] = &[
 ];
 
 /// The settings written after the MCP write folders.
-pub(super) const LAST: &[Field] =
-    &[switch!("auto_arm", auto_arm), named!("setting_descriptions", setting_descriptions, Descriptions)];
+pub(super) const LAST: &[Field] = &[
+    switch!("auto_arm", auto_arm),
+    named!("setting_descriptions", setting_descriptions, Descriptions),
+    switch!("implicit_tones", implicit_tones),
+];
 
 /// The setting `key` names, among all of them.
 pub(super) fn field(key: &str) -> Option<&'static Field> {

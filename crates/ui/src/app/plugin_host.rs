@@ -84,6 +84,11 @@ impl App {
         {
             ctx.request_repaint_after(std::time::Duration::from_millis(250));
         }
+        // A plug-in's texts for the values lanes and panels show are on their way: drawn as soon
+        // as they come, not at the next move of the pointer (#1482).
+        if self.session().is_some_and(suhina_session::Session::plugin_texts_pending) {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        }
     }
 
     /// While the active project's plug-ins start, a dialog over the window says how far they
@@ -183,6 +188,9 @@ impl App {
                             file,
                             spec,
                             enabled: p["enabled"].as_bool().unwrap_or(true),
+                            owned: p["owned"].as_bool().unwrap_or(false),
+                            hosting: p["hosting"].as_str().unwrap_or("binary").to_string(),
+                            ara: p["ara"].as_bool().unwrap_or(false),
                         }
                     })
                     .collect();
@@ -210,6 +218,8 @@ impl App {
                     | PluginRequest::SetFolderEnabled(..)
                     | PluginRequest::SetEnabled(..)
                     | PluginRequest::SetEnabledMany(..)
+                    | PluginRequest::SetOwnedMany(..)
+                    | PluginRequest::SetHostingMany(..)
             )
         {
             self.status =
@@ -264,35 +274,98 @@ impl App {
                 self.plugins_read = false;
             }
             PluginRequest::SetEnabledMany(specs, enabled) => {
-                let mut done = 0;
-                for spec in &specs {
-                    match self.projects.execute("plugin.setEnabled", &json!({ "plugin": spec, "enabled": enabled })) {
-                        Ok(_) => done += 1,
-                        Err(e) => {
-                            self.status = Status::Error(e.message().to_owned());
-                            break;
-                        }
+                // One command and one save for them all, however many.
+                match self.projects.execute("plugin.setEnabled", &json!({ "plugins": specs, "enabled": enabled })) {
+                    Ok(_) => {
+                        let what = if specs.len() == 1 {
+                            "1 plug-in is".to_string()
+                        } else {
+                            format!("{} plug-ins are", specs.len())
+                        };
+                        self.status = Status::Done(format!("{what} {}", if enabled { "on" } else { "off" }));
                     }
-                }
-                if done == specs.len() {
-                    self.status = Status::Done(format!("{done} plug-ins are {}", if enabled { "on" } else { "off" }));
+                    Err(e) => self.status = Status::Error(e.message().to_owned()),
                 }
                 self.browser.relist();
                 self.plugins_read = false;
             }
-            PluginRequest::ScanFile(file) => {
+            PluginRequest::SetHostingMany(specs, hosting) => {
+                // One command a plug-in; the first that refuses (an ARA plug-in asked for a
+                // process of its own) says why, and the others still take it.
+                let mut refused = None;
+                let mut set = 0usize;
+                for spec in &specs {
+                    match self.projects.execute("plugin.setHosting", &json!({ "plugin": spec, "hosting": hosting })) {
+                        Ok(_) => set += 1,
+                        Err(e) => {
+                            refused.get_or_insert_with(|| e.message().to_owned());
+                        }
+                    }
+                }
+                self.status = match refused {
+                    Some(why) => Status::Error(why),
+                    None => {
+                        let what = if set == 1 { "1 plug-in".to_string() } else { format!("{set} plug-ins") };
+                        Status::Done(format!(
+                            "{what}: {} from their next start (open the project again)",
+                            crate::settings::plugin_manager::hosting_label(&hosting).to_lowercase()
+                        ))
+                    }
+                };
+                self.plugins_read = false;
+            }
+            PluginRequest::SetOwnedMany(specs, owned) => {
+                match self.projects.execute("plugin.setOwned", &json!({ "plugins": specs, "owned": owned })) {
+                    Ok(_) => {
+                        let what = if specs.len() == 1 {
+                            "1 plug-in".to_string()
+                        } else {
+                            format!("{} plug-ins", specs.len())
+                        };
+                        self.status = Status::Done(if owned {
+                            format!("{what} marked as owned")
+                        } else {
+                            format!("{what} no longer marked as owned")
+                        });
+                    }
+                    Err(e) => self.status = Status::Error(e.message().to_owned()),
+                }
+                self.plugins_read = false;
+            }
+            // The desktop app shows it in the system's file manager, as it does a backup.
+            PluginRequest::ShowFile(file) => self.reveal = Some(std::path::PathBuf::from(file)),
+            PluginRequest::ScanFiles(files) => {
                 let mut library = self.projects.library_mut().clone();
                 let (done, receive) = std::sync::mpsc::channel();
+                let count = files.len();
                 let started = std::thread::Builder::new().name("suhina-plugin-scan".into()).spawn(move || {
-                    let report =
-                        library.scan_file_again(std::path::Path::new(&file)).map(|r| (r.read.len(), r.failed.len()));
-                    let _unheard = done.send(ScanDone { library, report });
+                    // Each file read again in turn; the first that cannot be stops the rest.
+                    let mut totals = Ok((0, 0));
+                    for file in &files {
+                        match library.scan_file_again(std::path::Path::new(file)) {
+                            Ok(r) => {
+                                if let Ok((read, failed)) = &mut totals {
+                                    *read += r.read.len();
+                                    *failed += r.failed.len();
+                                }
+                            }
+                            Err(e) => {
+                                totals = Err(e);
+                                break;
+                            }
+                        }
+                    }
+                    let _unheard = done.send(ScanDone { library, report: totals });
                 });
                 match started {
                     Ok(_) => {
                         self.scan = Some(receive);
                         self.plugins.scanning = true;
-                        self.status = Status::Hint("Scanning the file again".into());
+                        self.status = Status::Hint(if count == 1 {
+                            "Scanning the file again".into()
+                        } else {
+                            format!("Scanning {count} files again")
+                        });
                     }
                     Err(e) => self.status = Status::Error(format!("could not start the scan: {e}")),
                 }

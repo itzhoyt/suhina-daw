@@ -279,6 +279,18 @@ pub(super) fn draw(
     };
     let (name_on_light, name_on_dark) = (name_ink(true), name_ink(false));
     let rows = scale_view::RowBase::look();
+    // What a note is seen against: the grid under it and its key's row, so its fill and its name
+    // can be kept readable where the clip's colour comes close to them.
+    let grid_background = grid_style.background.unwrap_or_else(|| crate::detail::detail_fill("window"));
+    let grid_background = composite_note_color(el.background_or(Color32::TRANSPARENT), grid_background);
+    let row_fill = |key| {
+        let own = if is_black(key) { black_row_style.background } else { row_style.background };
+        let highlighted = clip.scale.filter(|_| state.highlight_scale);
+        match (highlighted, own) {
+            (None, Some(own)) => own,
+            _ => scale_view::row_fill(highlighted, key, is_black(key), clip.color, rows),
+        }
+    };
     // The velocity stems: a line takes only the colour its own rule declares, not the text
     // colour of the `piano-roll` around it, so muted and selected stems keep their distinction.
     let velocity_look = crate::kit::element::VELOCITY.look();
@@ -313,12 +325,7 @@ pub(super) fn draw(
         );
         // With a scale highlighted, its keys are lighter; without one, the white keys are
         // (› Scale and key).
-        let own = if is_black(key) { black_row_style.background } else { row_style.background };
-        let highlighted = clip.scale.filter(|_| state.highlight_scale);
-        let fill = match (highlighted, own) {
-            (None, Some(own)) => own,
-            _ => scale_view::row_fill(highlighted, key, is_black(key), clip.color, rows),
-        };
+        let fill = row_fill(key);
         grid_painter.rect_filled(row, 0.0, fill);
         // The row under the pointer, so it can be followed to the strip that names it.
         if state.hover_key() == Some(key) {
@@ -336,6 +343,9 @@ pub(super) fn draw(
     let last_beat = layout.beat_at(layout.grid.right());
     let bar = clip.bar_beats.max(EPSILON);
     let lane_painter = painter.with_clip_rect(layout.lane);
+    let lane_background =
+        composite_note_color(velocity_look.background_or(Color32::TRANSPARENT), crate::detail::detail_fill("panel"));
+    lane_painter.rect_filled(layout.lane, 0.0, lane_background);
     for (beat, on_bar) in grid.lines(first_beat, last_beat, MAX_LINES) {
         let x = layout.x_of(beat).round() + 0.5;
         let color = line_colour(on_bar);
@@ -417,6 +427,9 @@ pub(super) fn draw(
                 let midi = (f64::from(suhina_session::midi_velocity(note.velocity)) + by).clamp(1.0, 127.0);
                 Note { velocity: (midi / 127.0) as f32, ..*note }
             }
+            Some(Effect::VelocityRange(range)) => {
+                Note { velocity_range: i8::try_from(range.clamp(-127, 127)).unwrap_or(0), ..*note }
+            }
             _ => *note,
         }
     };
@@ -460,6 +473,10 @@ pub(super) fn draw(
     // The selected notes are drawn last, over the others: a note moved onto another of its key is
     // seen while it is moved.
     let order = (0..clip.notes.len()).filter(|i| !state.selected.contains(i)).chain(state.selected.iter().copied());
+    // The velocity lane's stems, gathered while the notes are drawn and drawn after them: every
+    // note in time has one, its row in view or not (› Velocity lane).
+    let mut stems: Vec<Stem> = Vec::new();
+    let any_selected = !state.selected.is_empty();
     for i in order {
         let Some(note) = clip.notes.get(i) else { continue };
         let note = shown(i, note);
@@ -472,15 +489,30 @@ pub(super) fn draw(
             }
         };
         let rect = layout.note_rect(&note);
+        {
+            let muted = if state.muting.contains(&i) { state.mute_target } else { note.muted };
+            let selected = state.selected.contains(&i) || selecting.is_some_and(|r| r.intersects(rect));
+            let ink = if muted {
+                muted_stem.color()
+            } else if selected {
+                selected_stem.color()
+            } else {
+                // Kept visible against the lane, as a dark clip colour on a dark lane is not.
+                visible_note_fill(velocity_look.own_color_or(clip.color), lane_background, 1.0)
+            };
+            // With notes selected, the others step back, so the selection's stems stand out.
+            let ink = if any_selected && !selected { ink.gamma_multiply(0.45) } else { ink };
+            stems.push(Stem { note, ink, selected });
+        }
         if !rect.intersects(layout.grid) {
             continue;
         }
         let velocity = f32::from(suhina_session::midi_velocity(note.velocity));
-        // A note an erase stroke has passed over is nearly gone; a muted note, and one a mute
-        // stroke holds, is faded with a dashed edge, so it is clearly there and clearly not
-        // playing (› Muting).
-        let muted = note.muted || (state.muting.contains(&i) && state.mute_target);
-        let unmuting = state.muting.contains(&i) && !state.mute_target;
+        // A note an erase stroke has passed over is nearly gone; a muted note is faded with a
+        // dashed edge, so it is clearly there and clearly not playing. A note a mute stroke has
+        // passed over is drawn as the stroke leaves it, muted or unmuted, before the button is
+        // up (› Muting).
+        let muted = if state.muting.contains(&i) { state.mute_target } else { note.muted };
         let erasing = state.erasing.contains(&i);
         let selected = state.selected.contains(&i) || selecting.is_some_and(|r| r.intersects(rect));
         let alpha = note_alpha(velocity, NoteLook { erasing, muted, selected, outside: outside(&note) });
@@ -493,7 +525,15 @@ pub(super) fn draw(
         };
         let radius = style.radius.unwrap_or(0.0);
         let own = if selected { selected_note_color(clip.color, selected_accent, outline) } else { clip.color };
-        grid_painter.rect_filled(rect, radius, style.background.unwrap_or(own).gamma_multiply(alpha));
+        let background = composite_note_color(row_fill(note.key), grid_background);
+        let background = if outside(&note) { composite_note_color(shade, background) } else { background };
+        let fill = visible_note_fill(style.background.unwrap_or(own), background, alpha);
+        let fill = if muted || erasing || outside(&note) {
+            style.background.unwrap_or(own).gamma_multiply(alpha)
+        } else {
+            fill
+        };
+        grid_painter.rect_filled(rect, radius, fill);
         // A muted note's edge is its dashes alone: a solid edge under them in the same colour would
         // hide them. A selected one keeps its selection's edge.
         if let Some(border) = style.border.filter(|_| selected || !muted) {
@@ -505,32 +545,23 @@ pub(super) fn draw(
         if selected && style.border.is_none() {
             grid_painter.rect_stroke(rect, radius, Stroke::new(1.0, outline), StrokeKind::Inside);
         }
-        if unmuting {
-            // The stroke is bringing this note back: a solid edge says so before the button is up.
-            let edge = muted_style.border.unwrap_or(dashes);
-            grid_painter.rect_stroke(rect, 0.0, Stroke::new(1.0, edge), StrokeKind::Inside);
-        }
         // Every note says which it is; on a block too small for its name, as much as fits.
-        let readable = if alpha >= 0.55 { name_on_light } else { name_on_dark };
+        // The theme's name ink for a strong or a faint note, kept where it reads on the note as
+        // seen over its row; otherwise the readable ink for that colour.
+        let shown_fill = composite_note_color(fill, background);
+        let themed = if alpha >= 0.55 { name_on_light } else { name_on_dark };
+        let ink = if theme::text_contrast(themed, shown_fill) >= 4.5 { themed } else { theme::text_on(shown_fill) };
         grid_painter.with_clip_rect(rect.intersect(layout.grid)).text(
             Pos2::new(rect.left() + 2.0, rect.center().y),
             Align2::LEFT_CENTER,
             key_name(note.key),
             theme::mono_font(theme::TEXT_TINY),
-            style.color.unwrap_or(readable),
+            style.color.unwrap_or(ink),
         );
-        // Its velocity stem.
-        let x = rect.left().round() + 0.5;
-        let top = layout.lane.bottom() - 2.0 - velocity_height(note.velocity, layout.lane);
-        let stem = if muted {
-            muted_stem.color()
-        } else if selected {
-            selected_stem.color()
-        } else {
-            velocity_look.own_color_or(clip.color)
-        };
-        lane_painter.vline(x, egui::Rangef::new(top, layout.lane.bottom()), Stroke::new(1.0, stem));
-        lane_painter.rect_filled(Rect::from_min_size(Pos2::new(x - 2.5, top), Vec2::new(5.0, 2.0)), 0.0, stem);
+    }
+    paint_lane_scale(&lane_painter, layout);
+    for stem in &stems {
+        paint_stem(&lane_painter, layout, stem);
     }
     if let Some(rect) = selecting {
         let edge = crate::kit::element::MARQUEE.attribute("kind", "notes").look().color();
@@ -607,9 +638,21 @@ pub(super) fn draw(
             ),
             Align2::RIGHT_CENTER,
             "1",
-            font,
+            font.clone(),
             hint,
         );
+        // The middle of the scale, where the lane draws its faint line, once there is room for it.
+        if lane_keys.height() >= 48.0 {
+            let y = layout.lane.bottom() - 2.0 - velocity_height(64.0 / 127.0, layout.lane);
+            widgets::text_in(
+                &painter,
+                Rect::from_min_max(Pos2::new(lane_keys.left(), y - 5.0), Pos2::new(lane_keys.right() - 3.0, y + 5.0)),
+                Align2::RIGHT_CENTER,
+                "64",
+                font,
+                hint,
+            );
+        }
     }
     painter.vline(layout.keys.right() - 0.5, layout.keys.y_range(), theme::hairline(band));
 }
@@ -648,6 +691,62 @@ pub(super) fn for_readers(ui: &Ui, layout: &Layout, clip: &PianoClip, state: &Pi
     }
 }
 
+/// A note's velocity stem as the lane draws it: the note where it is shown, its ink, and whether
+/// it is selected.
+struct Stem {
+    note: Note,
+    ink: Color32,
+    selected: bool,
+}
+
+/// The lane's scale: a faint line at velocity 64, between the 127 and 1 the key column names
+/// (› Velocity lane).
+fn paint_lane_scale(painter: &egui::Painter, layout: &Layout) {
+    if layout.lane.height() < 24.0 {
+        return;
+    }
+    let y = (layout.lane.bottom() - 2.0 - velocity_height(64.0 / 127.0, layout.lane)).round() + 0.5;
+    let ink = crate::kit::element::PIANO_GRID.look().border().gamma_multiply(0.6);
+    painter.hline(layout.lane.x_range(), y, Stroke::new(1.0, ink));
+}
+
+/// A note's velocity stem (› Velocity lane): a line 2 px wide from the lane's foot up to its
+/// velocity, a round head there to grab, and from the head a thin line along the note's length, so
+/// notes starting together (a chord) are told apart by their heights. A velocity range shows as a
+/// faint whisker beside the head, from the velocity to the furthest the note may play, with a tick
+/// at that end (› Velocity range).
+fn paint_stem(painter: &egui::Painter, layout: &Layout, stem: &Stem) {
+    let note = &stem.note;
+    let x = layout.x_of(note.time).round() + 0.5;
+    let end = layout.x_of(note.time + note.duration.max(0.0));
+    if end < layout.lane.left() - 4.0 || x > layout.lane.right() + 4.0 {
+        return;
+    }
+    let top = layout.lane.bottom() - 2.0 - velocity_height(note.velocity, layout.lane);
+    let ink = stem.ink;
+    if end > x + 4.0 {
+        painter.hline(x..=end, top, Stroke::new(1.0, ink.gamma_multiply(0.7)));
+    }
+    if note.velocity_range != 0 {
+        let own = f32::from(suhina_session::midi_velocity(note.velocity));
+        let far = (own + f32::from(note.velocity_range)).clamp(1.0, 127.0);
+        let far_top = layout.lane.bottom() - 2.0 - velocity_height(far / 127.0, layout.lane);
+        let whisker = x + 6.0;
+        painter.vline(
+            whisker,
+            egui::Rangef::new(top.min(far_top), top.max(far_top)),
+            Stroke::new(3.0, ink.gamma_multiply(0.35)),
+        );
+        painter.hline(whisker - 2.5..=whisker + 2.5, far_top, Stroke::new(1.0, ink.gamma_multiply(0.7)));
+    }
+    painter.vline(x, egui::Rangef::new(top, layout.lane.bottom()), Stroke::new(2.0, ink));
+    let radius = if stem.selected { 3.5 } else { 3.0 };
+    painter.circle_filled(Pos2::new(x, top), radius, ink);
+    if stem.selected {
+        painter.circle_stroke(Pos2::new(x, top), radius + 1.0, Stroke::new(1.0, ink.gamma_multiply(0.5)));
+    }
+}
+
 /// What a note's look depends on besides its velocity.
 #[derive(Clone, Copy)]
 struct NoteLook {
@@ -659,9 +758,28 @@ struct NoteLook {
     outside: bool,
 }
 
-/// How opaque a note is drawn: by its velocity (1 to 127), nearly gone under an erase stroke,
-/// faded while muted, fainter outside the clip's window. Selected, it stays bright enough to tell
-/// at any velocity, unless it is muted or an erase stroke has passed over it.
+/// Composite premultiplied sRGBA before choosing contrasting ink.
+fn composite_note_color(color: Color32, background: Color32) -> Color32 {
+    let [r, g, b, a] = color.to_array();
+    let [br, bg, bb, _] = background.to_array();
+    let blend = |front: u8, back: u8| (u16::from(front) + u16::from(back) * u16::from(255 - a) / 255).min(255) as u8;
+    Color32::from_rgb(blend(r, br), blend(g, bg), blend(b, bb))
+}
+
+/// Keep an active note visible without changing the stored clip colour.
+fn visible_note_fill(color: Color32, background: Color32, alpha: f32) -> Color32 {
+    let fill = composite_note_color(color.gamma_multiply(alpha), background);
+    let target = theme::text_on(background);
+    for step in 0..=32 {
+        let candidate = crate::kit::motion::mix(fill, target, step as f32 / 32.0);
+        if theme::contrast(candidate, background) >= 3.0 {
+            return candidate;
+        }
+    }
+    target
+}
+
+/// Velocity dims notes; muted, erased and out-of-window notes remain quieter still.
 fn note_alpha(velocity: f32, look: NoteLook) -> f32 {
     let alpha = if look.erasing {
         0.12
@@ -677,6 +795,38 @@ fn note_alpha(velocity: f32, look: NoteLook) -> f32 {
 #[cfg(test)]
 mod note_alpha_tests {
     use super::*;
+
+    /// `text_on` reads the theme's inks from the style engine, so the checks run in a frame of the
+    /// built-in theme, not in whatever another test left behind.
+    fn in_built_in_theme(check: impl Fn()) {
+        let ctx = egui::Context::default();
+        theme::use_colors(&ctx, &theme::Colors::new());
+        theme::in_style_frame(&ctx, |_| check());
+    }
+
+    #[test]
+    fn faded_white_note_labels_use_the_composited_dark_background() {
+        in_built_in_theme(|| {
+            let shown = composite_note_color(Color32::WHITE.gamma_multiply(0.12), Color32::BLACK);
+            assert!(theme::contrast(theme::text_on(shown), shown) >= 4.5);
+            assert!(theme::text_on(shown).to_array()[0] > 128);
+        });
+    }
+
+    #[test]
+    fn dark_imported_notes_remain_visible_with_readable_labels() {
+        in_built_in_theme(|| {
+            for background in [Color32::BLACK, Color32::WHITE] {
+                for color in [Color32::from_rgb(23, 17, 17), Color32::BLACK, Color32::WHITE] {
+                    for alpha in [0.4, 0.85, 1.0] {
+                        let fill = visible_note_fill(color, background, alpha);
+                        assert!(theme::contrast(fill, background) >= 3.0);
+                        assert!(theme::contrast(theme::text_on(fill), fill) >= 4.5);
+                    }
+                }
+            }
+        });
+    }
 
     #[test]
     fn an_erase_stroke_dims_a_selected_note_too() {

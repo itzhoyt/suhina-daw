@@ -199,6 +199,9 @@ pub enum View {
 /// The Settings dialog at most: the page list, the page and their margins wide, and tall enough
 /// for the longest page on a common screen.
 const SETTINGS_SIZE: Vec2 = Vec2::new(772.0, 720.0);
+/// The plug-in manager's size where the window has room: wider than Settings, for its library
+/// sidebar, its table and the selected plug-in's panel side by side (#1461).
+const MANAGER_SIZE: Vec2 = Vec2::new(1180.0, 760.0);
 
 /// A project with unsaved changes the user is leaving, and what happens once they answered.
 #[derive(Debug, Clone, PartialEq)]
@@ -215,6 +218,23 @@ enum AfterLeaving {
     Replace(PathBuf),
     /// Quit; the projects already answered for are not asked about again.
     Quit(Vec<ProjectId>),
+}
+
+/// A project about to be left (its tab closed, or another project opened in its place) whose
+/// plug-ins are being read, a frame at a time, for edits made in their own windows: the window
+/// keeps drawing meanwhile, and the leaving goes on once the read is done (`Rack::poll_edits`).
+#[derive(Debug, Clone)]
+struct LeaveCheck {
+    project: ProjectId,
+    then: LeaveThen,
+}
+
+#[derive(Debug, Clone)]
+enum LeaveThen {
+    /// Open this file in its place.
+    Replace(PathBuf),
+    /// Run this `project.close` again, its check done.
+    Close(Action),
 }
 
 /// A folder's packs ([docs/spec/nam-amp-and-cab.md] › Folders › Packs): its subfolders, each
@@ -405,9 +425,20 @@ pub struct App {
     stashes: HashMap<ProjectId, Stash>,
     /// A dropped file waiting for the user to choose a new tab or replace.
     open_prompt: Option<PathBuf>,
+    /// A zipped project waiting for the person to say where to unpack it.
+    zip_prompt: Option<tabs::ZipPrompt>,
     /// A project with unsaved changes waiting for Save, Don't save or Cancel before it is closed,
     /// replaced or the app quits.
     unsaved_prompt: Option<Leaving>,
+    /// Projects being left while their plug-ins are read for edits ([`LeaveCheck`]), one after
+    /// another in the order asked: a second close while a read goes on waits its turn.
+    leave_checks: std::collections::VecDeque<LeaveCheck>,
+    /// The leave checks waited this frame or an earlier one (a dialog, a question, a checked
+    /// close held them): the waiting check's read starts again once, when they go on.
+    leave_checks_paused: bool,
+    /// A `project.close` whose plug-ins were read: run without reading them again once actions
+    /// run (kept while a dialog holds them).
+    checked_close: Option<(ProjectId, Action)>,
     /// Clips a plug-in edits about to go to another track, waiting for Keep edits or Copy as
     /// new (ADR 0033 step 6): the move, and the plug-in's name.
     ara_prompt: Option<(Action, String)>,
@@ -702,11 +733,16 @@ pub struct App {
     /// bar shows it and once a second is often enough for a number that moves that slowly.
     ram: Option<u64>,
     next_ram: Option<f64>,
+    /// The CPU load the control bar shows instead of the engine's, in per mille: a fixed figure
+    /// for renders (`hold_cpu`).
+    held_cpu: Option<u32>,
     /// Blur and glass even with animations off (`suhina-theme-render`, whose scenes are still).
     effects_when_still: bool,
     /// The audio's health counters last traced: device underruns, late stretched frames and late
     /// plug-in blocks, and the input's.
-    audio_traced: (u64, u64, u64, u64, u64),
+    audio_traced: (u64, u64, u64, u64, u64, u64),
+    /// The render threads setting last handed to the engine (`audio.setRenderThreads`).
+    render_threads_applied: Option<u32>,
     /// A clip carried between the views, and the view whose name it hovers over since when.
     carry: Option<Carry>,
     /// A device carried from a chain or a strip's list onto another track (#688): its track and
@@ -750,7 +786,11 @@ impl App {
             shown_project: None,
             stashes: HashMap::new(),
             open_prompt: None,
+            zip_prompt: None,
             unsaved_prompt: None,
+            leave_checks: std::collections::VecDeque::new(),
+            leave_checks_paused: false,
+            checked_close: None,
             traced_output: None,
             ara_prompt: None,
             folder_drop: None,
@@ -883,9 +923,11 @@ impl App {
             recovery_open: None,
             reveal: None,
             ram: None,
+            held_cpu: None,
             next_ram: None,
             effects_when_still: false,
-            audio_traced: (0, 0, 0, 0, 0),
+            audio_traced: (0, 0, 0, 0, 0, 0),
+            render_threads_applied: None,
             carry: None,
             device_carry: None,
             applied_grid: None,
@@ -1079,6 +1121,17 @@ impl App {
             self.themes.import(path);
             return;
         }
+        // A zipped project opens once the person said where to unpack it.
+        if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("zip")) {
+            match suhina_session::zipped_project(&path) {
+                Ok(Some(found)) => self.zip_prompt = Some(tabs::ZipPrompt::new(path, found)),
+                Ok(None) => {
+                    self.status = Status::Error(format!("{} holds no project (.als or .suhina)", path.display()))
+                }
+                Err(e) => self.status = Status::Error(e),
+            }
+            return;
+        }
         if self.projects.is_empty() {
             self.open_request = Some((path, OpenAs::NewTab));
             return;
@@ -1093,16 +1146,84 @@ impl App {
     /// Opens `path` as asked; in place of a project with unsaved changes only after the user
     /// answered whether to save them.
     fn open_as(&mut self, path: PathBuf, how: OpenAs) {
-        if how == OpenAs::Replace
-            && let Some(active) = self.projects.active()
-        {
-            self.check_plugin_edits(active);
-        }
         match self.projects.active() {
-            Some(active) if how == OpenAs::Replace && self.unsaved(active) => {
-                self.unsaved_prompt = Some(Leaving { project: active, then: AfterLeaving::Replace(path) });
+            // Its plug-ins are read for edits first, a frame at a time ([`App::poll_leave_check`]):
+            // reading them all at once here held the window for up to a second.
+            Some(active) if how == OpenAs::Replace => {
+                self.leave_checks.push_back(LeaveCheck { project: active, then: LeaveThen::Replace(path) });
             }
             _ => self.open_request = Some((path, how)),
+        }
+    }
+
+    /// Advances the read of a project's plug-ins before it is left ([`LeaveCheck`]); once done,
+    /// asks about unsaved changes or goes on.
+    fn poll_leave_check(&mut self, ctx: &egui::Context) {
+        // A checked close not yet run keeps the next one waiting: it holds the one slot. So does a
+        // question about unsaved changes, or the save it led to: the next check's question would
+        // take its place, and the file it was asked for would be lost unanswered.
+        // A dialog that holds the actions holds the checks too: a close checked now would only
+        // wait for it, its plug-ins read before edits made while it is open.
+        if self.checked_close.is_some() || self.unsaved_prompt_open() || self.dialog_holds_actions() {
+            self.leave_checks_paused = true;
+            return;
+        }
+        // The read under way starts again once, as the checks go on: its second may have passed
+        // while they waited, and it would then end on the states read before the pause. Not on
+        // every paused frame: quitting reads the same plug-ins meanwhile, and a check started
+        // again each frame would never end.
+        if std::mem::take(&mut self.leave_checks_paused)
+            && let Some(waiting) = self.leave_checks.front()
+            && let Some(session) = self.projects.get_mut(waiting.project)
+        {
+            session.rack_mut().restart_edit_check();
+        }
+        let Some(check) = self.leave_checks.pop_front() else { return };
+        let Some(session) = self.projects.get_mut(check.project) else {
+            // Closed meanwhile: a file to open goes where the active project is now, after its
+            // own check, in this one's place in the queue; a close has nothing left to do.
+            if let LeaveThen::Replace(path) = check.then {
+                self.retarget(path);
+            }
+            ctx.request_repaint();
+            return;
+        };
+        if !session.rack_mut().poll_edits() {
+            self.leave_checks.push_front(check);
+            ctx.request_repaint_after(std::time::Duration::from_millis(10));
+            return;
+        }
+        if !self.leave_checks.is_empty() {
+            ctx.request_repaint();
+        }
+        match check.then {
+            // Another project became the active one while this one was read: the file opens in
+            // its place only after the same check of that one, its unsaved changes asked about,
+            // still ahead of the requests made after it.
+            LeaveThen::Replace(path) if self.projects.active() != Some(check.project) => {
+                self.retarget(path);
+                ctx.request_repaint();
+            }
+            LeaveThen::Replace(path) if self.unsaved(check.project) => {
+                self.unsaved_prompt = Some(Leaving { project: check.project, then: AfterLeaving::Replace(path) });
+            }
+            LeaveThen::Replace(path) => self.open_request = Some((path, OpenAs::Replace)),
+            LeaveThen::Close(action) => {
+                self.checked_close = Some((check.project, action));
+                ctx.request_repaint();
+            }
+        }
+    }
+
+    /// A file to open in place of the project that was to be left, which is no longer the active
+    /// one: checked against the active project now, at the front of the queue, where the request
+    /// stood ([`App::open_as`] would put it behind the requests made since).
+    fn retarget(&mut self, path: PathBuf) {
+        match self.projects.active() {
+            Some(active) => {
+                self.leave_checks.push_front(LeaveCheck { project: active, then: LeaveThen::Replace(path) })
+            }
+            None => self.open_request = Some((path, OpenAs::Replace)),
         }
     }
 
@@ -1112,12 +1233,6 @@ impl App {
 
     /// Reads the project's running plug-ins' states now, so a change made only in a plug-in's
     /// editor counts as unsaved before the window asks whether to save.
-    fn check_plugin_edits(&mut self, id: ProjectId) {
-        if let Some(session) = self.projects.get_mut(id) {
-            session.rack_mut().check_edits();
-        }
-    }
-
     /// The open projects with unsaved changes, in tab order.
     fn unsaved_projects(&self) -> Vec<ProjectId> {
         self.projects.ids().into_iter().filter(|id| self.unsaved(*id)).collect()
@@ -1345,6 +1460,13 @@ impl App {
         self.next_ram = Some(f64::INFINITY);
     }
 
+    /// Shows `milli` per mille as the engine's CPU load from now on, whether or not an engine
+    /// plays, so that renders of the window show the CPU read-out the same each time
+    /// (`suhina-theme-render`). `None` shows the engine's own again.
+    pub fn hold_cpu(&mut self, milli: Option<u32>) {
+        self.held_cpu = milli;
+    }
+
     /// Keeps blur and glass on while animations are off, so that still renders of the window show
     /// them (`suhina-theme-render`). Off, the animations setting turns them off with motion.
     pub fn effects_when_still(&mut self, on: bool) {
@@ -1441,24 +1563,33 @@ impl App {
             .session()
             .and_then(|s| suhina_session::plugin_device_name(s.project(), worst))
             .unwrap_or_else(|| "none".into());
+        let (late, late_track, late_most) = player.render_misses();
+        let late_name = self
+            .session()
+            .filter(|_| late_most > 0)
+            .map(|s| s.project().shown_track_name(TrackId(u32::try_from(late_track).unwrap_or(u32::MAX))))
+            .unwrap_or_else(|| "none".into());
         let cpu = player.cpu_monitor().load_milli();
         let running = player.monitor().running();
-        let (was_device, was_stretched, was_misses, was_blocked, was_input) = self.audio_traced;
+        let (was_device, was_stretched, was_misses, was_blocked, was_input, was_late) = self.audio_traced;
         if running
             || device > was_device
             || input > was_input
             || stretched > was_stretched
             || misses > was_misses
             || blocked > was_blocked
+            || late > was_late
             || cpu >= 700
         {
             suhina_plugins::trace!(
-                "audio: device underruns {device} (+{}), input underruns {input} (+{}), stretched frames late {stretched} (+{}), edits that restarted stretched clips {moves}, plug-in blocks late {misses} (+{}, most {worst_name}: {worst_misses}), not sent {blocked} (+{}), longest trip {worst_trip} µs, engine load {:.1} %, {}, buffer {} frames, block {}, latency {:.1} ms{}, output {:?}, beat {:.6}, last late render (us, queued, period, frames) {:?}, input diagnostics {:?}, render diagnostics (output cycles, ASIO inputs, renders, max per cycle, extra, timeouts) {:?}",
+                "audio: device underruns {device} (+{}), input underruns {input} (+{}), stretched frames late {stretched} (+{}), edits that restarted stretched clips {moves}, plug-in blocks late {misses} (+{}, most {worst_name}: {worst_misses}), not sent {blocked} (+{}), longest trip {worst_trip} µs, render blocks late {late} (+{}, most {late_name}: {late_most}) on {} threads, engine load {:.1} %, {}, buffer {} frames, block {}, latency {:.1} ms{}, output {:?}, beat {:.6}, last late render (us, queued, period, frames) {:?}, input diagnostics {:?}, render diagnostics (output cycles, ASIO inputs, renders, max per cycle, extra, timeouts) {:?}",
                 device.saturating_sub(was_device),
                 input.saturating_sub(was_input),
                 stretched.saturating_sub(was_stretched),
                 misses.saturating_sub(was_misses),
                 blocked.saturating_sub(was_blocked),
+                late.saturating_sub(was_late),
+                info.as_ref().map_or(1, |i| i.render_threads),
                 f64::from(cpu) / 10.0,
                 if running { "playing" } else { "stopped" },
                 info.as_ref().map_or(0, |i| i.buffer_frames),
@@ -1472,12 +1603,20 @@ impl App {
                 info.as_ref().map(|i| i.render_diagnostics),
             );
         }
-        self.audio_traced = (device, stretched, misses, blocked, input);
+        self.audio_traced = (device, stretched, misses, blocked, input, late);
     }
 
     /// Uses `settings` from now on, as loaded from the settings file.
     pub fn set_settings(&mut self, ctx: &egui::Context, settings: Settings) {
+        // Before any output opens, so its renderer takes a lane of the chosen pool (ADR 0038).
+        if self.render_threads_applied != Some(settings.render_threads) {
+            suhina_engine::set_process_render_threads(suhina_engine::render_threads_for(
+                settings.render_threads as usize,
+            ));
+            self.render_threads_applied = Some(settings.render_threads);
+        }
         self.projects.set_backup_settings(settings.backup, settings.backup_clean_up);
+        self.projects.set_implicit_tones(settings.implicit_tones);
         motion::set_enabled(ctx, settings.animations);
         crate::kit::widgets::set_drag_hides_pointer(ctx, settings.drag_hides_pointer);
         self.arrangement.headers_left = headers_left(settings.track_headers);
@@ -1502,13 +1641,23 @@ impl App {
 
     pub fn set_themes(&mut self, ctx: &egui::Context, files: Vec<ThemeEntry>, folder: Option<String>) {
         self.themes.set(files, folder);
-        // A variant in use whose file went: its theme's own values take its place.
-        if self.themes.get(&self.settings.theme).is_none()
-            && let Some((base, _)) = self.settings.theme.split_once('@')
-            && self.themes.get(base).is_some()
-        {
-            self.settings.theme = base.to_owned();
-            self.settings_changed = true;
+        // A variant in use whose file went: its theme's own values take its place. A theme moved
+        // to the Trash from Settings: Suhina Studio. A theme missing from one reading of the
+        // folder (not there yet, or half written) stays the choice, for when it is back.
+        if self.themes.get(&self.settings.theme).is_none() {
+            let base = self.settings.theme.split_once('@').map_or(self.settings.theme.as_str(), |(base, _)| base);
+            let next = if self.themes.get(base).is_some() {
+                Some(base.to_owned())
+            } else {
+                self.themes.trashed(base).then(|| crate::kit::theme::BUILT_IN.to_owned())
+            };
+            if let Some(next) = next {
+                self.settings.theme = next;
+                self.settings_changed = true;
+            }
+        }
+        if let Some(notice) = self.themes.take_notice() {
+            self.status = Status::Hint(notice);
         }
         ctx.request_repaint();
     }
@@ -1526,8 +1675,22 @@ impl App {
         self.theme_import = Some((path, name));
     }
 
+    /// Closes Settings, unless the variant editor has unsaved changes: Settings then shows the
+    /// editor asking whether to save them, and stays open, and what closed it is not done (run it
+    /// again after answering). Returns whether Settings closed.
+    pub fn close_settings(&mut self) -> bool {
+        if self.settings_open && self.page.theme_editor && self.themes.edited(&self.settings.theme) {
+            crate::settings::settings_view::ask_leave(&mut self.page, crate::settings::settings_view::Leave::Close);
+            return false;
+        }
+        self.settings_open = false;
+        self.themes.end_draft();
+        true
+    }
+
     pub fn use_theme(&mut self, ctx: &egui::Context, id: &str) {
         if self.themes.get(id).is_some() {
+            self.themes.keep_draft_of(id);
             self.settings.theme = id.to_string();
             self.settings_changed = true;
             ctx.request_repaint();
@@ -1746,7 +1909,9 @@ impl App {
 
     /// Shows the project dialog; `open` puts the keys in its path field (File › Open).
     pub fn open_project_dialog(&mut self, open: bool) {
-        self.settings_open = false;
+        if !self.close_settings() {
+            return;
+        }
         self.save_prompt = None;
         self.project_dialog = Some(DialogState { path: String::new(), focus_path: open });
         self.lists_wanted = true;
@@ -1924,11 +2089,14 @@ impl App {
                 .map(|d| d.path.trim().to_string())
                 .filter(|text| !text.is_empty())
                 .and_then(|text| Path::new(&text).parent().map(Path::to_path_buf)),
+            PickField::MissingFile => self.missing.pick_start(),
+            PickField::MissingFolder => folder_of(&self.missing.folder),
             PickField::BrowserFolder
             | PickField::McpWriteFolder
             | PickField::CopyToFolder
             | PickField::PluginFolder
-            | PickField::BackgroundImage => None,
+            | PickField::BackgroundImage
+            | PickField::ThemePackage => None,
         };
         self.pick_request = Some(PickRequest { field, start });
     }
@@ -1961,6 +2129,19 @@ impl App {
                 return;
             }
             PickField::NamModelsFolder => self.settings.nam_models_folder = text,
+            PickField::ThemePackage => {
+                self.themes.import(path);
+                return;
+            }
+            PickField::MissingFile => {
+                self.missing.picked_file(path);
+                return;
+            }
+            PickField::MissingFolder => {
+                self.missing.folder = text;
+                self.missing.search_folder(path);
+                return;
+            }
             // A folder whose files move with it asks first.
             PickField::ThemesFolder | PickField::DataFolder => self.folder_move = Some((field, Some(path))),
             PickField::IrFolder => self.settings.irs_folder = text,
@@ -2122,8 +2303,12 @@ impl App {
     /// The project dialog and the save prompt, over the window, and what was chosen in them.
     fn project_dialogs(&mut self, ui: &Ui, window: Rect) {
         let name = self.projects.active().and_then(|id| self.projects.name(id)).unwrap_or("the project").to_string();
-        if let Some(crate::app::missing_files::Outcome::Apply(files)) = self.missing.panel(ui, window, &name) {
-            self.relink(files);
+        match self.missing.panel(ui, window, &name) {
+            Some(crate::app::missing_files::Outcome::Apply(files)) => self.relink(files),
+            Some(crate::app::missing_files::Outcome::PickFile) => self.ask_pick(PickField::MissingFile),
+            Some(crate::app::missing_files::Outcome::PickFolder) => self.ask_pick(PickField::MissingFolder),
+            Some(crate::app::missing_files::Outcome::Reveal(path)) => self.reveal = Some(path),
+            None => {}
         }
         if let Some(mut state) = self.project_dialog.take() {
             match project_dialog::show(ui, window, &mut state, &self.project_lists) {
@@ -2538,6 +2723,14 @@ impl App {
         self.background.wait();
     }
 
+    /// For tests and renders: waits for the work the window has on other threads, the background
+    /// image being loaded ([`App::wait_for_background`]) and the sample map's layout, so the next
+    /// frame takes in their results. Returns at once when nothing is on the way.
+    pub fn wait_for_workers(&mut self) {
+        self.background.wait();
+        self.sample_map.wait_for_workers();
+    }
+
     /// A theme file read again after it changed on disk; the window redraws in it if it is the
     /// theme in use.
     pub fn put_theme(&mut self, ctx: &egui::Context, entry: ThemeEntry) {
@@ -2855,6 +3048,14 @@ impl App {
                         (None, None) => self.view.selected = Some(track),
                     }
                 }
+                // A consolidated clip is selected in place of the clips it was made of, so the
+                // detail area (the piano roll) goes on showing what was being edited.
+                if action.id == "clip.consolidate"
+                    && let Some(track) = result["track"].as_u64().and_then(|t| u32::try_from(t).ok()).map(TrackId)
+                    && let Some(clip) = result["clip"].as_u64().and_then(|c| u32::try_from(c).ok()).map(ClipId)
+                {
+                    self.arrangement.select_clip(track, clip);
+                }
                 // Duplicated devices: the copies are picked, so the next Ctrl+D copies them on.
                 if action.id == "device.duplicateMany"
                     && let Some(track) = action.params["track"].as_u64().and_then(|t| u32::try_from(t).ok())
@@ -2955,6 +3156,10 @@ impl App {
             crate::kit::skin::configure(&crate::kit::skin::Skin::default());
             crate::kit::native_css::set_colors(&theme::Colors::new());
         }
+        // The selection colour is the window's, as the theme's colours are: a chosen one goes over
+        // the theme's `selection.background` before the styles are worked out.
+        crate::kit::selection::set(self.settings.view.selection);
+        self.arrangement.automation.colours = self.settings.view.automation;
         // The backdrop's opacity before the styles: the frame an image first shows in is faded.
         let backdrop = self.background.prepare(ui, &self.settings);
         let _css_frame = crate::kit::native_css::frame_with_motion(
@@ -3016,6 +3221,24 @@ impl App {
         }
         let window = ui.max_rect();
         let mut actions = Vec::new();
+        // A close whose plug-ins were read, held by a dialog that opened since: it goes back to
+        // the front of the leave checks, so its plug-ins are read again once the dialog is gone (an
+        // edit made in a plug-in's editor meanwhile still asks whether to save), and it is not
+        // handed to the held actions every frame, which would keep asking for frames.
+        if self.dialog_holds_actions()
+            && let Some((project, action)) = self.checked_close.take()
+        {
+            self.leave_checks.push_front(LeaveCheck { project, then: LeaveThen::Close(action) });
+        }
+        self.poll_leave_check(ui.ctx());
+        // A close whose plug-ins were read goes on now.
+        let checked_close = self.checked_close.take();
+        if let Some((_, action)) = &checked_close {
+            actions.push(action.clone());
+        }
+        let checked = checked_close.as_ref().map(|(project, _)| *project);
+        // Whether the checked close ran: a dialog that holds the actions keeps it for later.
+        let mut checked_ran = false;
         crate::detail::device_canvas::finish_sample_audition(ui.ctx(), self.projects.active(), &mut actions);
         let revision = self.revision;
         ui.ctx().data_mut(|d| {
@@ -3127,7 +3350,8 @@ impl App {
         });
         let progress = grid.as_ref().map(|g| self.progress(g)).unwrap_or_default();
         // The CPU load the control bar shows, from the engine's monitor, in per mille.
-        let cpu = self.session().and_then(|s| s.player()).map(|p| p.cpu_monitor().load_milli());
+        let cpu =
+            self.held_cpu.or_else(|| self.session().and_then(|s| s.player()).map(|p| p.cpu_monitor().load_milli()));
         // The program's own RAM, the control bar shows it beside the CPU: measured once a
         // second, not every frame. The plug-in host processes report their own once a second,
         // and their share is added: the number is what Suhina and its hosts use together.
@@ -3189,16 +3413,21 @@ impl App {
         // Under the system's title bar: the toolbar's background, as behind the bars below it.
         // Full screen hides the title bar, and the room with it.
         if self.title_bar > 0.0 && !full_screen {
-            egui::Panel::top("title-bar").exact_size(self.title_bar).frame(egui::Frame::NONE).show(ui, |ui| {
-                // The strip reads as the top of the toolbar under it, in the toolbar's colour.
-                let _style_class = crate::kit::element::TOOLBAR.enter();
-                let top = egui::CornerRadius { nw: corner, ne: corner, sw: 0, se: 0 };
-                ui.painter().rect_filled(
-                    ui.max_rect(),
-                    top,
-                    crate::kit::style_class::surface_or(crate::kit::element::app_fill("panel")),
-                );
-            });
+            // No egui line under it: the strip reads as the toolbar's own top (#1487).
+            egui::Panel::top("title-bar")
+                .exact_size(self.title_bar)
+                .show_separator_line(false)
+                .frame(egui::Frame::NONE)
+                .show(ui, |ui| {
+                    // The strip reads as the top of the toolbar under it, in the toolbar's colour.
+                    let _style_class = crate::kit::element::TOOLBAR.enter();
+                    let top = egui::CornerRadius { nw: corner, ne: corner, sw: 0, se: 0 };
+                    ui.painter().rect_filled(
+                        ui.max_rect(),
+                        top,
+                        crate::kit::style_class::surface_or(crate::kit::element::app_fill("panel")),
+                    );
+                });
         }
         let project_info = self
             .projects
@@ -3221,7 +3450,7 @@ impl App {
             .unwrap_or_default();
         // The application bar is the window's title bar where Suhina draws its own (Windows); where
         // the system draws one, it would be a second.
-        if cfg!(target_os = "windows") {
+        if crate::kit::platform::current().draws_own_title_bar() {
             let bar = crate::kit::element::APPLICATION_BAR.enter();
             egui::Panel::top("application-bar")
                 .exact_size(bar_height(ui, &bar, 28.0))
@@ -3240,11 +3469,11 @@ impl App {
         // theme moves them). Each region draws in its rectangle and takes input only there; a
         // region the grid gives none is not drawn.
         self.missing.sync(&mut self.projects, self.revision);
-        let missing_bar = self.open_prompt.is_none() && self.missing.bar_shows();
+        let prompting = self.open_prompt.is_some() || self.zip_prompt.is_some();
+        let missing_bar = !prompting && self.missing.bar_shows();
         // A newer build is offered in a bar over an open project; the start panel has its own
         // line (`docs/spec/updates.md` › With a project open).
-        let update_bar =
-            self.open_prompt.is_none() && !missing_bar && !self.start_panel_open() && self.updates.bar_shows();
+        let update_bar = !prompting && !missing_bar && !self.start_panel_open() && self.updates.bar_shows();
         // The browser stays hidden on the start panel (nothing to drop into); its setting keeps
         // its value for when a project opens. It slides in and out from its side, with animations
         // on (#708).
@@ -3254,8 +3483,7 @@ impl App {
         // The grid takes the whole room, as the panels it replaced did: what the window holds
         // reaches its edges, for what is painted behind it.
         ui.advance_cursor_after_rect(room);
-        let input =
-            self.window_input(room.size(), grid.is_some(), self.open_prompt.is_some() || missing_bar || update_bar);
+        let input = self.window_input(room.size(), grid.is_some(), prompting || missing_bar || update_bar);
         let layout = crate::kit::native_css::window(&input)
             .map(|layout| layout.translated(room.min.to_vec2()))
             .unwrap_or_default();
@@ -3322,6 +3550,8 @@ impl App {
                 let inside = style.paint(ui.painter(), rect).content;
                 if self.open_prompt.is_some() {
                     in_region(ui, inside, |ui| self.open_prompt_bar(ui));
+                } else if self.zip_prompt.is_some() {
+                    in_region(ui, inside, |ui| self.zip_prompt_bar(ui));
                 } else if missing_bar {
                     in_region(ui, inside, |ui| self.missing.bar(ui, inside));
                 } else if update_bar && let Some(wanted) = in_region(ui, inside, |ui| self.updates.bar(ui, inside)) {
@@ -3627,7 +3857,9 @@ impl App {
                                 }
                             };
                             let mut timeline = timeline;
+                            self.frame_trace.mark("timeline build");
                             timeline.automation.take_plugins(session.project(), plugin_lists);
+                            self.frame_trace.mark("lane plug-ins");
                             // A parameter moved in a plug-in's own editor shows in its track's
                             // lanes, against the parameters just built (#1205).
                             for (track, key) in std::mem::take(&mut self.touched_lanes) {
@@ -3635,6 +3867,7 @@ impl App {
                             }
                             timeline.follow_automation(session.project());
                             timeline.follow_drag(self.arrangement.automation.dragged.as_ref());
+                            self.frame_trace.mark("lane values");
                             timeline.recording_spans = session.arrangement_recording_spans();
                             timeline.midi_ports = self.projects.midi_ports().to_vec();
                             // What ARA plug-ins found in the audio clips, as it is now (#720).
@@ -3651,6 +3884,7 @@ impl App {
                                 .filter(|l| l.clips.iter().any(|c| c.audio))
                                 .filter_map(|l| Some((l.track, session.rack().ara_activity(l.track)?)))
                                 .collect();
+                            self.frame_trace.mark("ara notes");
                             if !timeline.ara_activity.is_empty() {
                                 // Its progress moves without input.
                                 ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
@@ -3795,8 +4029,24 @@ impl App {
             let closing = (action.id == "project.close")
                 .then(|| action.params["project"].as_u64().and_then(|n| u32::try_from(n).ok()).map(ProjectId))
                 .flatten();
-            if let Some(project) = closing {
-                self.check_plugin_edits(project);
+            // Its plug-ins are read for edits first, a frame at a time; the close runs again
+            // once they are ([`App::poll_leave_check`]).
+            if let Some(project) = closing
+                && checked != Some(project)
+            {
+                let asked = |c: &LeaveCheck| c.project == project && matches!(c.then, LeaveThen::Close(_));
+                if !self.leave_checks.iter().any(asked) {
+                    self.leave_checks.push_back(LeaveCheck { project, then: LeaveThen::Close(action.clone()) });
+                }
+                continue;
+            }
+            if closing.is_some() && closing == checked {
+                // A second close of it in the same frame (a click on its tab released as its read
+                // ended) has nothing left to close: it would only report the project as gone.
+                if checked_ran {
+                    continue;
+                }
+                checked_ran = true;
             }
             if self.window_action(action) {
                 continue;
@@ -3864,6 +4114,9 @@ impl App {
             if !failed && let Some(line) = clipboard_line(action.id) {
                 ui.ctx().copy_text(line);
             }
+        }
+        if !checked_ran && let Some(close) = checked_close {
+            self.checked_close = Some(close);
         }
         // A selection this frame's commands or clicks made arms its track.
         self.follow_selection_with_arm();

@@ -154,9 +154,11 @@ fn native_toolbar_css_styles_modules_and_buttons_without_reflow_or_sibling_leaks
     // Suhina's own button artwork is not drawn under it.
     assert!(!harness.output().shapes.iter().any(|shape| matches!(&shape.shape,
             egui::Shape::Rect(rect) if rect.rect == play && rect.brush.is_some())));
+    // On whole pixels, as egui puts the button's border.
+    let face = egui::emath::GuiRounding::round_to_pixels(play, harness.ctx.pixels_per_point());
     assert!(
         harness.output().shapes.iter().any(|shape| matches!(&shape.shape,
-            egui::Shape::Mesh(mesh) if mesh.calc_bounds() == play && mesh.vertices.len() > 4)),
+            egui::Shape::Mesh(mesh) if mesh.calc_bounds() == face && mesh.vertices.len() > 4)),
         "gradient must remain visible above the button's surface"
     );
     harness.get_by_label("Play").click();
@@ -167,14 +169,14 @@ fn native_toolbar_css_styles_modules_and_buttons_without_reflow_or_sibling_leaks
 
 #[test]
 fn dark_gloss_example_keeps_native_layout_and_transport_commands() {
-    assert!(crate::kit::native_css::inspect(theme::GLOSS_EXAMPLE).unwrap().is_empty());
+    assert!(crate::kit::native_css::inspect(include_str!("../../tests/fixtures/dark-gloss.css")).unwrap().is_empty());
     let mut harness = native_bar();
     let play = harness.get_by_label("Play").rect();
     let tempo = harness.get_by_label("Tempo").rect();
-    harness
-        .state_mut()
-        .app
-        .use_test_skin(skin::Skin { css: Some(std::sync::Arc::from(theme::GLOSS_EXAMPLE)), ..Default::default() });
+    harness.state_mut().app.use_test_skin(skin::Skin {
+        css: Some(std::sync::Arc::from(include_str!("../../tests/fixtures/dark-gloss.css"))),
+        ..Default::default()
+    });
     harness.run();
     assert_eq!(play, harness.get_by_label("Play").rect());
     assert_eq!(tempo, harness.get_by_label("Tempo").rect());

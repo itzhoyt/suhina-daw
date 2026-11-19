@@ -53,8 +53,7 @@ pub fn expanded_device(ctx: &egui::Context, detail: &Detail) -> Option<(TrackId,
 }
 
 /// Gives every canvas among `devices`, inside their groups too, what the host hands it:
-/// `#expanded` (1 for the device at `open`) and the device's live values from `readouts`. Returns
-/// whether any device had live values.
+/// `#expanded` (1 for the device at `open`) and the device's live values from `readouts`. Returns whether any device had live values.
 pub fn give_host_values(
     devices: &mut [DeviceBox],
     open: Option<&DeviceAt>,

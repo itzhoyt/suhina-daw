@@ -15,7 +15,16 @@ use suhina_session::{MAX_NOTES_PER_COMMAND, Session};
 use crate::support::{run, without_ids};
 
 fn note(time: f64, key: u8) -> Note {
-    Note { time, duration: 1.0, key, velocity: 100.0 / 127.0, release_velocity: 0.5, channel: 0, muted: false }
+    Note {
+        time,
+        duration: 1.0,
+        key,
+        velocity: 100.0 / 127.0,
+        release_velocity: 0.5,
+        channel: 0,
+        muted: false,
+        velocity_range: 0,
+    }
 }
 
 fn clip(content: u32, start: f64) -> Clip {
@@ -43,6 +52,7 @@ fn clip(content: u32, start: f64) -> Clip {
 
 fn content(id: u32, lanes: Vec<ContentLane>) -> ClipContent {
     ClipContent {
+        linked: false,
         id: ContentId(id),
         name: format!("C{id}"),
         length: 4.0,
@@ -61,6 +71,7 @@ fn project() -> Project {
 
 fn project_built() -> Project {
     let track = |id: u32, name: &str| Track {
+        folder: false,
         id: TrackId(id),
         name: name.into(),
         color: None,

@@ -476,9 +476,19 @@ impl Look {
         self.themed(Paint::OwnColor).unwrap_or(token)
     }
 
+    /// The item's own `color` ([`Paint::OwnColor`]), where a theme's rule on it gives one.
+    pub fn own_color(&self) -> Option<Color32> {
+        self.themed(Paint::OwnColor)
+    }
+
     /// The item's text colour, inherited from a sheet's rule around it too; else `token`.
     pub fn color_or(&self, token: Color32) -> Color32 {
         self.themed(Paint::Color).unwrap_or(token)
+    }
+
+    /// The item's `font-size`, where the sheet sets one; else `fallback`.
+    pub fn font_size_or(&self, fallback: f32) -> f32 {
+        self.0.as_ref().filter(|s| s.authored.font_size).map_or(fallback, |s| s.font_size)
     }
 
     /// The item's `background-color`, where the sheet sets one; else `token`.
@@ -661,15 +671,21 @@ impl Entered {
     /// The element's border in `rect`, for a bar whose background its caller paints with the
     /// window's corners (and [`Entered::paint_background`] its gradients and inset shadows): then,
     /// as after [`Entered::paint`], its contents go in the content box returned, are clipped to
-    /// its padding box when it hides its overflow, and its outline comes when it leaves scope.
+    /// its padding box when it hides its overflow, and its outline comes when it leaves scope. The
+    /// border follows the sheet's `border-radius`, as [`Entered::paint_background`]'s gradients and
+    /// shadows do, and is square where the sheet sets none (#1487).
     pub fn paint_border(&self, painter: &Painter, rect: Rect) -> Rect {
         self.finish();
         let style = self.style();
+        let radius = style
+            .as_ref()
+            .filter(|style| style.authored.radius)
+            .map_or(0.0, |style| style.radius.min(rect.width().min(rect.height()) / 2.0).max(0.0));
         if let Some(style) = &style {
-            super::native_css::border(painter, rect, 0.0, style);
+            super::native_css::border(painter, rect, radius, style);
         }
         let outer = super::native_css::outer_clip(self.scope.node);
-        self.contain(painter, rect, style, 0.0, outer)
+        self.contain(painter, rect, style, radius, outer)
     }
 
     /// The element's content box in `rect`; and from here on, until it is dropped, its box

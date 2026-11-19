@@ -173,6 +173,27 @@ impl App {
         }
     }
 
+    /// Runs `audio.setRenderThreads` with the setting's choice; the output in use opens again.
+    /// A refused choice (an open ASIO control panel) puts the setting back to the one the engine
+    /// runs with, so the two never differ.
+    pub(super) fn choose_render_threads(&mut self) {
+        let choice = self.settings.render_threads;
+        match self.projects.execute("audio.setRenderThreads", &json!({ "threads": choice })) {
+            Ok(result) => {
+                self.render_threads_applied = Some(choice);
+                let threads = result["render_threads"].as_u64().unwrap_or(1);
+                let note = if result["from_environment"] == json!(true) { " (SUHINA_RENDER_THREADS)" } else { "" };
+                self.status =
+                    Status::Done(format!("Rendering on {threads} thread{}{note}", if threads == 1 { "" } else { "s" }));
+            }
+            Err(e) => {
+                self.settings.render_threads = self.render_threads_applied.unwrap_or(1);
+                self.settings_changed = true;
+                self.status = Status::Error(e.message().to_owned());
+            }
+        }
+    }
+
     /// Settings can stay over the main view or move into an independent native window.
     pub(super) fn settings_dialog(&mut self, ui: &Ui, window: Rect) {
         if suhina_plugins::trace::on() {
@@ -201,11 +222,16 @@ impl App {
                     let _status = ui.scope_builder(egui::UiBuilder::new().max_rect(bar), |ui| {
                         self.status_bar(ui, &status_bar, None)
                     });
-                    if ui.input(|input| {
-                        input.viewport().close_requested()
-                            || (self.page.capture.is_none() && input.modifiers.command && input.key_pressed(Key::Comma))
-                    }) {
-                        self.settings_open = false;
+                    let requested = ui.input(|input| input.viewport().close_requested());
+                    if (requested
+                        || ui.input(|input| {
+                            self.page.capture.is_none() && input.modifiers.command && input.key_pressed(Key::Comma)
+                        }))
+                        && !self.close_settings()
+                        && requested
+                    {
+                        // Unsaved variant edits: the window stays, asking whether to save them.
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::CancelClose);
                     }
                 });
             });
@@ -225,7 +251,8 @@ impl App {
                 let clear = clear_of(window, self.status_bar_rect);
                 let mut bounds = largest(&clear).shrink(PAD);
                 bounds = bounds.intersect(window.shrink(PAD));
-                let size = Vec2::new(SETTINGS_SIZE.x.min(bounds.width()), SETTINGS_SIZE.y.min(bounds.height()));
+                let want = if self.plugins.manager.open { MANAGER_SIZE } else { SETTINGS_SIZE };
+                let size = Vec2::new(want.x.min(bounds.width()), want.y.min(bounds.height()));
                 let position = ui
                     .ctx()
                     .data(|data| data.get_temp::<Pos2>(Id::unique("settings-panel-position")))
@@ -260,6 +287,13 @@ impl App {
             if !self.plugins_read {
                 self.read_plugins();
             }
+            // The column widths as last dragged, from the UI settings.
+            if !self.plugins.manager.widths_read {
+                self.plugins.manager.widths = self.settings.plugin_manager_columns.clone();
+                self.plugins.manager.hidden = self.settings.plugin_manager_hidden.clone();
+                self.plugins.manager.owned_first = self.settings.plugin_manager_owned_first;
+                self.plugins.manager.widths_read = true;
+            }
             let out = ui
                 .scope_builder(egui::UiBuilder::new().max_rect(panel), |ui| {
                     settings_view::input_style(ui);
@@ -268,6 +302,18 @@ impl App {
                 .inner;
             if out.close {
                 self.plugins.manager.open = false;
+            }
+            if let Some(widths) = out.widths {
+                self.settings.plugin_manager_columns = widths;
+                self.settings_changed = true;
+            }
+            if let Some(first) = out.owned_first {
+                self.settings.plugin_manager_owned_first = first;
+                self.settings_changed = true;
+            }
+            if let Some(hidden) = out.hidden {
+                self.settings.plugin_manager_hidden = hidden;
+                self.settings_changed = true;
             }
             if let Some(request) = out.request {
                 self.plugin_request(request);
@@ -283,8 +329,7 @@ impl App {
         if !self.plugins_read {
             self.read_plugins();
         }
-        let mut themes = self.themes.view(&self.settings.theme);
-        themes.global_liquid = self.settings.view.liquid;
+        let themes = self.themes.view(&self.settings.theme);
         self.about.projects_default = self.default_folders.0.display().to_string();
         self.about.templates_default = self.default_folders.1.display().to_string();
         self.about.themes_default = self.themes_default_folder.display().to_string();
@@ -301,6 +346,13 @@ impl App {
         };
         let tag_limit = self.projects.file_library_mut().tag_limit();
         self.about.audio_live = self.session().and_then(Session::player).and_then(suhina_session::Player::output_info);
+        self.about.audio_late_track = self
+            .about
+            .audio_live
+            .as_ref()
+            .and_then(|info| info.worst_render_track)
+            .zip(self.session())
+            .map(|(track, session)| session.project().shown_track_name(suhina_engine::model::TrackId(track)));
         if self.page.shows_devices() {
             // The latency and underruns change while it plays, and controllers come and go.
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
@@ -326,7 +378,9 @@ impl App {
         };
         let outcome = settings_view::show(ui, &mut self.settings, sources, &mut self.page);
         if let Some(request) = outcome.themes.clone() {
-            if let Some(id) = self.themes.request(&self.settings.theme, request) {
+            if request == settings_view::ThemeRequest::Import {
+                self.ask_pick(PickField::ThemePackage);
+            } else if let Some(id) = self.themes.request(&self.settings.theme, request) {
                 self.settings.theme = id;
                 self.settings_changed = true;
             }
@@ -369,10 +423,14 @@ impl App {
         if outcome.changed && self.settings.track_input() != self.projects.track_input() {
             self.choose_track_input();
         }
+        if outcome.changed && Some(self.settings.render_threads) != self.render_threads_applied {
+            self.choose_render_threads();
+        }
         if outcome.changed {
             // Each audio device keeps its input and default track input as the session has them.
             self.settings.keep_device_inputs(self.projects.device_inputs());
             self.projects.set_backup_settings(self.settings.backup, self.settings.backup_clean_up);
+            self.projects.set_implicit_tones(self.settings.implicit_tones);
             motion::set_enabled(ui.ctx(), self.settings.animations);
             crate::kit::widgets::set_drag_hides_pointer(ui.ctx(), self.settings.drag_hides_pointer);
             self.arrangement.headers_left = headers_left(self.settings.track_headers);
@@ -384,7 +442,12 @@ impl App {
             self.settings_changed = true;
         }
         if outcome.close {
-            self.settings_open = false;
+            self.close_settings();
+        }
+        // The variant editor's draft lives while the editor is open (a search over it keeps it);
+        // leaving the editor any other way drops it unsaved.
+        if !(self.page.page == settings_view::Page::Theme && self.page.theme_editor) {
+            self.themes.end_draft();
         }
         if outcome.move_by.is_finite() && outcome.move_by != Vec2::ZERO {
             let position = ui.max_rect().min + outcome.move_by;

@@ -360,6 +360,10 @@ pub const BROWSER_WIDTHS: (u32, u32) = (200, 4000);
 pub const BROWSER_WIDTH: u32 = 300;
 /// The most of the window's width the browser panel takes.
 pub const BROWSER_SHARE: f32 = 0.5;
+/// The narrowest and widest a column of the plug-in manager is kept, in points, and how many
+/// columns it has.
+pub const MANAGER_COLUMN: (u32, u32) = (24, 2000);
+pub const MANAGER_COLUMNS: usize = crate::settings::plugin_manager::COLUMN_COUNT;
 /// The preview's level, in dB: its range and its default.
 /// The longest sample the sample map shows by default, and the range it may be set to.
 pub const MAP_MAX_SECONDS: u32 = 10;
@@ -404,6 +408,10 @@ impl Descriptions {
         [Self::Tooltip, Self::Icon, Self::Shown].into_iter().find(|d| d.param() == text)
     }
 }
+
+/// The choices of Settings › Audio › Advanced › Render threads, as saved: 1 Off, 0 Automatic,
+/// otherwise the threads (`audio.setRenderThreads`).
+pub const RENDER_THREAD_CHOICES: [u32; 5] = [1, 0, 2, 4, 8];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
@@ -503,6 +511,13 @@ pub struct Settings {
     /// whole desktop, so a second screen counts.
     pub map_window: bool,
     pub map_window_rect: Option<[i32; 4]>,
+    /// The plug-in manager's column widths in points, as dragged (`docs/spec/plugin-manager.md`
+    /// › The table); empty for the widths it starts with.
+    pub plugin_manager_columns: Vec<u32>,
+    /// The plug-in manager's columns hidden, by heading (`Vendor`, `File` …); empty shows all.
+    pub plugin_manager_hidden: Vec<String>,
+    /// The plug-in manager lists the plug-ins marked as owned first (its Owned first).
+    pub plugin_manager_owned_first: bool,
     /// Waveforms in decibels, so quiet parts show; linear otherwise.
     pub waveform_db: bool,
     /// The audio output (Settings › Audio, `audio.setOutput`): host and device by name, empty
@@ -534,6 +549,13 @@ pub struct Settings {
     /// Selecting a track arms it, so a MIDI controller plays what the user looks at (Settings ›
     /// MIDI, #834); off until the person turns it on.
     pub auto_arm: bool,
+    /// A MIDI track with no instrument plays its notes as a plain sine tone (Settings › Devices,
+    /// #1384); off until the person turns it on, so a track sounds only through an instrument.
+    pub implicit_tones: bool,
+    /// How many threads render each block, the render thread included (Settings › Audio ›
+    /// Advanced, `audio.setRenderThreads`, ADR 0038): 1, the render thread alone, until
+    /// rendering on several threads is measured on every platform; 0 lets Suhina choose.
+    pub render_threads: u32,
     /// The size of the whole window, in percent (`ZOOMS`): everything is drawn this much larger
     /// or smaller.
     pub zoom: u32,
@@ -601,6 +623,9 @@ impl Default for Settings {
             map_label_size: MAP_LABEL_SIZE,
             map_window: false,
             map_window_rect: None,
+            plugin_manager_columns: Vec::new(),
+            plugin_manager_hidden: Vec::new(),
+            plugin_manager_owned_first: false,
             waveform_db: false,
             audio_host: String::new(),
             audio_device: String::new(),
@@ -620,6 +645,8 @@ impl Default for Settings {
             mcp_project_folder: true,
             mcp_write_folders: Vec::new(),
             auto_arm: false,
+            implicit_tones: false,
+            render_threads: 1,
         }
     }
 }

@@ -155,7 +155,7 @@ refused or suspended, never by losing its edits.
 
 - Private image backgrounds use a cached source and display-scaled, alpha-correct blur; Settings keeps its own readable material. Native Mica has been removed.
 
-- Theme variants: a theme's settings are CSS custom properties, the core set every theme has and any it declares with `@property` (shown under Theme settings with a control for its type). A variant (`variants/<id>.json`) holds other values for them, such as a light and a dark version of one theme; the picker shows a swatch per variant, and editing a theme's settings saves a variant, so built-in themes need no copy for it.
+- Theme variants: a theme's settings are CSS custom properties, the core set every theme has and any it declares with `@property` (shown under Theme settings with a control for its type). A variant (`variants/<id>.json`) holds other values for them, such as a light and a dark version of one theme; the picker shows a swatch per variant, and a theme's settings are edited and saved in a variant, so built-in themes need no copy for it.
 - Theme packages: Export theme… writes one theme as a `.theme.suhina` file with a SHA-256 manifest; dropping or opening one brings it in after checking every file, and `suhina-cli theme pack` and `theme validate` do the same from a terminal.
 - Theme reach: sends, the add-track buttons, the ruler, loop bar and play position, clip parts and states (`:playing`, `:recording`), level-bar handles, fader sizes, a placeable mixer divider, the piano roll (grid, keys, notes with the clip's colour, tools), each built-in device's panel (`#device-compressor`), and the ordinary buttons and fields in Settings, dialogs and pages take the theme's CSS; artwork reads the theme's variables, draws text and can be nine-sliced. New clips take their track's colour (New clip colour).
 - Theme customization includes independent Browser/coloured-surface text, alpha-preserving gradients, editable liquid strengths, a private image backdrop and configurable application-bar identity/project information.
@@ -288,6 +288,50 @@ refused or suspended, never by losing its edits.
   fields' underlines, routing fields (`dropdown[kind="subtle"]`), dialog buttons and a typed
   number (`text-input[kind="typed"]`) take their elements' rules; a theme that leaves them alone
   looks as before.
+
+- Theme and variant picker: the theme in use heads Settings › Themes with its variant's name, a
+  swatch per variant and a + that starts a new variant (Save or Cancel); right-click menus on swatches and cards use, edit,
+  duplicate, export and delete them (to the system's Trash, after asking), with greyed
+  items that say why for built-in themes. The variant editor previews changes live and writes them
+  only on Save, Save as new variant or after asking on leaving; New theme… starts from Suhina's
+  defaults or any theme with a name, author and description, and Theme info… edits them.
+
+- The NAM Amp Modeler's panel is an amp head: its own artwork behind the controls, the pack,
+  the model and the ◀ ▶ model steppers on one row, EQ, HQ and the Mid Freq's value under them,
+  and six knobs on the plate. The texts, arcs, pointers and lit buttons take the theme's
+  colours, and a theme's `device.knob.body` and `device.knob.pointer` artwork puts knobs of the
+  user's own in place of the panel's.
+
+- **Instruments that are switched off or missing stay silent:** they still take their track's
+  notes, so no default tone plays in their place, and play again when switched on or relinked.
+- **Groups apply their pan and can take sends:** a group's pan applies once to its sum and its
+  post-fader sends; a send can go into a group, and solo follows sends as well as outputs.
+- **Linked copies:** Duplicate linked in a clip's menu makes copies that keep one content, so
+  editing any of them edits all; they carry a chain mark, and Unlink gives a clip its own content
+  again. An ordinary duplicate stays independent.
+- **Zipped projects:** a zip holding a project and its samples opens after a bar asks where to
+  unpack it (beside the zip by default); `suhina-cli` takes `--extract-to <folder>`.
+- **Sidechain:** a compressor or a plug-in can read another track as its key (its detector
+  listens to that track while it processes its own). Choose the track with the **SC** button
+  in the device's header or *Sidechain* in its menu, with where it is read (before or after
+  the track's devices, or after its fader) and its gain; or from the source's track menu,
+  *Sidechain to*. A plug-in hears the key on its sidechain input.
+- **Renaming devices:** a device's menu starts with its name in a field; type a new one and
+  press Enter. A renamed plug-in still loads as itself.
+- **Notes stop at the instrument:** a plug-in effect after a track's instrument no longer gets
+  the track's notes, so a compressor that MIDI notes can trigger no longer holds the sound down.
+- **The original VST2 first:** a project saved with a VST2 plug-in opens it with the installed
+  VST2 itself before a VST3 copy that only shares its id, so its saved sound loads; a VST3 that
+  declares it replaces the VST2 still comes first.
+- **A plug-in's process from the plug-in manager:** a row's menu has *Process* (one process per
+  plug-in file, per vendor, or a process of its own for each), from the plug-in's next start.
+- **No tone without an instrument:** a MIDI track with no instrument is silent, unless
+  *Tone without instrument* (Settings › Devices) is on; a switched-off or missing instrument is
+  always silent.
+- **Folders:** Put in a folder in a track's menu gathers tracks (a selection, or one track) under a
+  folder track that only groups them in view: what they play and where stays as it was. A folder
+  folds, names and colours its tracks like a group, has no mixer controls and is kept in the
+  project file.
 
 ### M0 Foundation
 - Rust workspace, GPL-3.0-or-later, CI (fmt, clippy `-D warnings`, tests) on Linux, Windows and
@@ -599,6 +643,11 @@ From Live Sets we authored ourselves in Live 12.4 ([format spec](docs/spec/als-f
 - A time range painted over several automation lanes, or over a track where no clip plays, is
   copied, duplicated and deleted with its automation on every lane.
 
+- Plug-ins are **marked as owned** (`plugin.setOwned`, `suhina-cli plugins own`): a mark of the
+  product, every format of it, for the user's own among a vendor's bundle that installs them all;
+  the plug-in manager lists the owned ones first on request, and **Turn off the rest** of a vendor
+  switches off its unmarked ones ([spec](https://github.com/suhina-daw/suhina-daw/blob/main/docs/spec/plugin-manager.md)).
+
 ### M8 UI (in progress)
 - `suhina` opens a Live Set (as an argument, or dropped on the window) or `--demo`, plays it
   stopped on the output chosen in Settings › Audio and shows the **Launcher view**: tracks as
@@ -705,9 +754,13 @@ From Live Sets we authored ourselves in Live 12.4 ([format spec](docs/spec/als-f
   ([spec](docs/spec/browser.md)).
 - The **plug-in manager** (Settings › Plug-ins › Manage plug-ins): every plug-in found and every
   file that gave none in one table (on, name, vendor, type, format, version, status, file),
-  sorted by any column and searched; a plug-in switched off is not offered and does not load,
-  and a failed file is read again with its **Scan again**
-  ([spec](docs/spec/plugin-manager.md)).
+  sorted by any column and searched, its columns resized (kept between starts, a double-click
+  fits one), hidden and scrolled sideways, a cut cell's full text on hover; a library sidebar
+  (all, plug-ins, enabled, disabled, owned, needs attention) with type, format and vendor
+  filters; the folders scans look in under **Scan locations**; a panel for the plug-in picked,
+  or one switch for several; a plug-in switched off is not offered and does not load, and a
+  failed file is read again with its **Scan again** or from its right-click menu, which also
+  shows it in the file manager ([spec](docs/spec/plugin-manager.md)).
 - Plug-in **folders per format**: each added folder for CLAP, VST3 or both, any folder switched
   off without removing it (`plugin.setFolderEnabled`); VST2 folders are ready for when VST2
   plug-ins are hosted.
@@ -717,10 +770,12 @@ From Live Sets we authored ourselves in Live 12.4 ([format spec](docs/spec/als-f
   loading it, such as an Intel-only plug-in on an Apple silicon Mac), is settled and listed
   apart.
 - **Missing files**: a project whose audio files cannot be found says so in a bar when it opens
-  (Find…, Later; View › Missing files). The panel lists them with the clips that use them, finds
-  them by name in the browser's folders and the project's folder at once, or in a folder typed or
-  dropped on it (walked in the background), best match first; Apply relinks them in one undo step
-  ([spec](docs/spec/missing-files.md)).
+  (Find…, Later; View › Missing files). The panel lists them in a table with the clips and
+  samplers that use them (inside device groups too), finds them by name in the browser's folders
+  and the project's folder at once, or in a folder chosen, typed or dropped on it (walked in the
+  background), best match first. A file located by hand (Locate…, dropped on its row, or its path
+  pasted) finds the others beside it and where its folder moved to; Copy file name hands the name
+  to a file search tool. Apply relinks them in one undo step ([spec](docs/spec/missing-files.md)).
 - The **sample map** (the browser's Sample map button, large in the main area, or in a window of its own for a second screen, Ctrl+Alt+M, which keeps its place): the samples
   of the browser's place laid out by how they sound, coloured by kind (kick, snare, clap, hats,
   toms, cymbals, percussion, bass, tonal, vocal, effect), as a free cloud or snapped to a grid that follows the view's shape (`soundmap.layout`
@@ -1159,4 +1214,41 @@ From Live Sets we authored ourselves in Live 12.4 ([format spec](docs/spec/als-f
   (`transport.toggleRecord`, as the record button), and `selection.arm` arms or disarms the
   selected tracks; both can be given any key in Settings › Keys
   (`docs/shortcuts.md`).
+
+- **Joining, fitting, cropping and splitting in the piano roll** ([#1284](https://github.com/suhina-daw/suhina-daw/issues/1284)):
+  Join notes (Ctrl+J) merges the selected notes on a key into one, over any gap, Fit to time selection
+  (Ctrl+Alt+J) stretches the selected notes to fill the time selection, Crop clip to time selection
+  (Ctrl+Shift+J) keeps only the selection, cutting notes at its edges, Split clip (Ctrl+E) cuts an
+  arrangement clip at the time selection's edges, and Set the clip's first beat here makes the
+  clicked point beat 1.1.1 without changing the sound. Each is a command (`note.join`,
+  `note.fitToTime`, `clip.crop`, `clip.split` with `ats`, `clip.setOrigin`) and an item of the
+  right-click menu.
+- **A right-click menu in the piano roll** ([#1283](https://github.com/suhina-daw/suhina-daw/issues/1283)):
+  a right click in the grid opens a menu at the pointer wherever the right button has no other
+  job: Cut, Copy, Paste, Duplicate, Delete, Invert selection, Quantize and its settings, Mute or
+  Unmute, Split here, Reverse, Loop selection, Set start and loop start here, the grid's entries, each with
+  its key, in compact rows. A right click
+  on a note selects it first; two quick right clicks on a ghost note still open its clip. The
+  tool's pointer icon follows a theme's artwork for the toolbar button.
+- **Selecting notes from the keyboard in the piano roll** ([#1281](https://github.com/suhina-daw/suhina-daw/issues/1281)):
+  with Ctrl held the arrow keys change the selection and leave the notes where they are.
+  Ctrl+Right and Ctrl+Left take each selected key to its next or previous note, so a selected
+  chord walks along its keys; Ctrl+Up and Ctrl+Down step through every note of the clip one at a
+  time, in time order and by key; with Shift they grow the selection or shrink it. The view
+  follows, the time selection becomes the notes' span, and with the audition on the newly
+  selected notes sound. The keys are keymap actions a preset can change.
+- **A note's velocity range** ([#1282](https://github.com/suhina-daw/suhina-daw/issues/1282)): each
+  note can have a range, -127 to 127, rolled every time it starts, so a looped part varies pass by
+  pass without its notes changing. The roll is a pure function of the note and where it plays, so
+  an offline render repeats and matches playback (ADR 0037). The velocity lane shows the range as
+  a fainter bar, Ctrl+drag on a stem sets it, Alt+Shift+Up and Down step it, the clip panel shows
+  it beside the velocities, and `note.setVelocityRange` sets it; project files are version 13.
+
+- Selected tracks and clips share one selection colour, the theme's `selection.background`, in
+  the Arrangement and the Launcher: a selected header and clip are filled with it, their own
+  colour kept in a band or down the clip's edge, and the selected tracks' lanes and Launcher
+  columns take a light tint of it. Settings › Appearance › Selection colour keeps the theme's,
+  keeps each clip's own colour or uses one picked colour. Settings › Arrangement › Automation ›
+  Automation colour can draw every automation line and point in one colour of the theme's or
+  picked ones, instead of the track's colour.
 

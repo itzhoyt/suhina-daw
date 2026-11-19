@@ -3,7 +3,7 @@ description: Suhina's visual language: principles, what stays familiar and what 
 read_when: UI design, colours, tokens, typography, theme, accent, track colours, browser design, squint test, reference mockups
 type: spec
 status: draft
-last_verified: 2026-11-14
+last_verified: 2026-11-19
 covers:
   - crates/ui/src/kit/theme.rs
   - crates/ui/src/settings/themes.rs
@@ -47,8 +47,11 @@ From [research](#sources) and the first design rounds:
 4. **Two type sizes:** 12 px for UI text, 11 px for small values. No bold headings. 9 px is
    kept for tags beside a name, 13 px for a page title (components › Global rules).
 5. **One window, no pop-ups.** Menus and pickers open in place. The exceptions are plug-in
-   editors, which float in their own windows (ADR 0006), the project dialogs, and the sample map
-   when the user moves it into a window of its own for another screen
+   editors, which float in their own windows (ADR 0006), the project dialogs, Settings' own
+   questions and forms (Help, and the Themes page's *Save changes…?*, *Delete…?*, New theme and
+   Theme info, boxes over Settings so the page does not move;
+   [spec](../spec/ui-settings.md#theme-gallery-and-variant-editor)), and the sample map when the
+   user moves it into a window of its own for another screen
    ([spec](../spec/sample-map.md) › Where the map is shown).
 6. **Progressive disclosure.** Controls appear when there is room or need (track height, toggled
    sections), never all at once.
@@ -132,6 +135,7 @@ a theme file can change any of them (see Themes). Current values:
 | `browser.text.primary`, `browser.text.secondary`, `browser.text.hint`, `browser.text.value` | `#ECE8E1`, `#B5B2AC`, `#85837E`, `#DAD6D0` | Independent browser names, labels, hints and values; older themes inherit the corresponding text tokens |
 | `accent` | `#A6A3FF` | The playhead, queued clips, a key being set |
 | `automation.pin` | `#A6A3FF` | The pin of an automation lane pinned below its track's top lane; the built-in themes set it to their `accent`, and an older theme file without it gets its `accent` |
+| `selection.background` | `#DBDAFF` | Selected track headers and clips in both views, and a light tint of the selected tracks' lanes and Launcher columns; the built-in themes mix it from their `accent` and white; Settings › Appearance › Selection colour can replace it |
 | `recording` | `#E5484D` | Recording and errors |
 | `recording.background` | `#4D2F2B` | Behind an armed track's arm button and a recording clip |
 | `meter.normal` | `#8BC48A` | A level meter below the top |
@@ -210,16 +214,15 @@ Light, High Contrast, and popular open palettes mapped onto the tokens: Nord, wi
 Snow Storm variants, and Catppuccin Mocha and Latte (all MIT, licences in `crates/ui/themes/licenses/`).
 
 Settings › Appearance › Themes picks a theme from cards showing each theme's thumbnail (or its
-swatch colour), with a swatch per variant. Edit current theme changes its grouped colours (writing the file); the name
-of a theme file is changed there too, and its file is renamed to match. Duplicate copies the
-theme in use, Reload reads the files again, Open folder shows the themes folder, Back up writes
-every theme file into `exports/suhina-themes-<date>.zip`, and Export template writes
-`exports/suhina-theme-template.zip`: a `my-theme/` folder (`theme.json`, and `theme.css` with every
-token written out), `README.md`
-(the format and every token, written so an AI agent can make a theme from it alone) and the
-built-in themes in `examples/`. A theme file or a zip of them (a backup) dropped on the window is
-added; a theme already there is not doubled, and one whose id is taken gets `-2`. A theme file
-saved in another editor shows within a second.
+swatch colour), with a swatch per variant; *Edit current variant* changes the settings the theme
+declares, previewed live and written only on Save
+([Settings › Themes](../spec/ui-settings.md#theme-gallery-and-variant-editor)). *New theme…*
+starts a theme from Suhina's defaults or any theme, *Theme info…* writes its name, author and
+description, Open the themes folder shows the folder, Back up writes every theme file into
+`exports/suhina-themes-<date>.zip`, and deleting a theme or variant moves it to the system's
+Trash. A theme file or a zip of them (a backup) dropped on the window is added; a theme already
+there is not doubled, and one whose id is taken gets `-2`. A theme file saved in another editor
+shows within a second.
 
 ## Squint test
 

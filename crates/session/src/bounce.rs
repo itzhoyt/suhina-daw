@@ -234,6 +234,7 @@ fn place(
         lanes: vec![ContentLane { target: None, data: LaneData::Audio(region) }].into(),
         extensions: Default::default(),
         scale: None,
+        linked: false,
     });
     let mut clip = Clip::new(content, start, end - start);
     clip.id = p.new_clip_id()?;

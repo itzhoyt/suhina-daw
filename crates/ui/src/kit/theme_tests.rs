@@ -177,26 +177,59 @@ fn the_first_token_names_are_no_longer_read() {
     assert!(theme.colors.is_empty());
 }
 
+/// The variant's declared colour scheme, not its colours, sets the native window's: dark text
+/// declared dark stays dark, and a sheet that asks for the scheme with `light-dark()` sees it.
 #[test]
-fn the_window_s_text_sets_the_native_windows_scheme() {
+fn the_declared_colour_scheme_sets_the_native_windows_scheme() {
     let ctx = egui::Context::default();
     let suhina_light = built_in_themes().into_iter().find(|(id, _)| *id == "suhina-light").unwrap().1;
+    assert!(suhina_light.light());
+    super::super::skin::configure(&suhina_light.skin);
     use_colors(&ctx, &suhina_light.colors);
     in_style_frame(&ctx, |_| ());
     assert_eq!(ctx.options(|o| o.theme_preference), egui::ThemePreference::Light);
     assert!(is_light());
-    use_colors(&ctx, &Colors::new());
+    // The same colours declared dark: the scheme follows the declaration.
+    let mut dark = suhina_light.skin.clone();
+    dark.light = false;
+    super::super::skin::configure(&dark);
     in_style_frame(&ctx, |_| ());
     assert_eq!(ctx.options(|o| o.theme_preference), egui::ThemePreference::Dark);
     assert!(!is_light());
+    // A sheet whose window text asks for the scheme does not flip it.
+    let asking = super::super::skin::Skin {
+        css: Some(":root { --text-primary: light-dark(white, black); } window { color: var(--text-primary); }".into()),
+        light: true,
+        ..Default::default()
+    };
+    super::super::skin::configure(&asking);
+    use_colors(&ctx, &Colors::new());
+    for _ in 0..3 {
+        in_style_frame(&ctx, |_| ());
+        assert!(is_light());
+    }
+    super::super::skin::configure(&super::super::skin::Skin::default());
+    in_style_frame(&ctx, |_| ());
 }
 
+/// Every theme and variant that comes with Suhina declares the colour scheme its text is made
+/// for: dark text on a light look.
 #[test]
-fn a_themes_colour_scheme_follows_its_text() {
-    let light = ["suhina-light", "catppuccin-latte", "suhina-sheet", "suhina-meadow"];
-    for (id, theme) in &built_in_themes() {
-        assert_eq!(luminance(theme.color("text-primary")) < 0.18, light.contains(id), "{id}");
+fn a_built_in_themes_declared_colour_scheme_matches_its_text() {
+    let themes = built_in_themes().into_iter().map(|(id, theme)| (id.to_owned(), theme));
+    let mut wrong = Vec::new();
+    for (id, theme) in themes.chain(built_in_variants()) {
+        let text = theme
+            .skin
+            .variables
+            .get("--text-primary")
+            .and_then(|value| super::super::native_css::color_of(value))
+            .unwrap_or_else(|| theme.color("text-primary"));
+        if (luminance(text) < 0.18) != theme.light() {
+            wrong.push(format!("{id}: declares {}", if theme.light() { "light" } else { "dark" }));
+        }
     }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
 #[test]
@@ -247,6 +280,7 @@ fn suhina_sheet_takes_its_colours_from_its_two_accent_shades() {
     assert_eq!(labels, ["Accent", "Accent, light"]);
     let values = [("--tint", "#A02050"), ("--tint-light", "#E8A0B8")];
     let variant = Variant {
+        light: None,
         id: "rose".into(),
         name: "Rose".into(),
         values: values.map(|(name, value)| (name.to_string(), value.to_string())).into(),
@@ -292,7 +326,7 @@ fn suhina_glass_clears_its_window_as_far_as_its_glassiness_says() {
     let (_, glass) = built_in_themes().into_iter().find(|(id, _)| *id == "suhina-glass").unwrap();
     let window_alpha = |glassiness: &str| {
         let values = [("--glassiness".to_string(), glassiness.to_string())].into();
-        let variant = Variant { id: "test".into(), name: "Test".into(), values };
+        let variant = Variant { light: None, id: "test".into(), name: "Test".into(), values };
         let (theme, warnings) = with_variant(&glass, Some(&variant));
         assert!(warnings.is_empty(), "{warnings:?}");
         theme.color("window-background").a()
@@ -391,9 +425,15 @@ fn a_theme_is_see_through_when_a_background_has_alpha() {
     use_colors(&ctx, &Colors::new());
 }
 
+/// The theme author guide, `docs/guide/theme-authoring.md`.
+fn guide() -> String {
+    // A Windows checkout has CRLF line ends.
+    include_str!("../../../../docs/guide/theme-authoring.md").replace("\r\n", "\n")
+}
+
 #[test]
-fn the_readme_names_every_token() {
-    let readme = template_readme();
+fn the_author_guide_names_every_token() {
+    let readme = guide();
     for rule in
         ["Backgrounds on the see-through window", "Closed-panel Grid tracks", "Value text on lit controls", "4:1"]
     {
@@ -534,11 +574,10 @@ fn a_former_kind_token_gets_a_notice_naming_its_sample_point_rule() {
     assert!(warnings.iter().any(|w| w == "kind.nothing is not a colour token"), "{warnings:?}");
 }
 
-/// The README's examples for track and clip colours are rules a theme can use as written.
+/// The guide's examples for track and clip colours are rules a theme can use as written.
 #[test]
-fn the_readme_s_track_and_clip_colour_examples_read_without_warnings() {
-    // A Windows checkout has CRLF line ends; the fences are found by their LF.
-    let readme = include_str!("../../themes/THEME-PACKAGE-README.md").replace("\r\n", "\n");
+fn the_author_guide_s_track_and_clip_colour_examples_read_without_warnings() {
+    let readme = guide();
     let from = readme.find("### Tracks").unwrap();
     let to = readme[from..].find("piano-grid {").unwrap() + from;
     let css: String =

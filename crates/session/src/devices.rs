@@ -589,6 +589,15 @@ fn device_json(path: &[usize], device: &Device) -> Value {
     if let Some(edits) = device.sample_edit_data().and_then(suhina_device_api::sample_edits::SampleEdits::decode) {
         value["sample_edits"] = json!({"version":1,"pins":edits.pins(),"suppressed":edits.suppressed()});
     }
+    // Its key (sidechain), so a panel and an agent see it without a second call.
+    if let Some(input) = device.inputs.first() {
+        value["key"] = json!({
+            "channel": input.source.channel().0,
+            "tap": input.source.tap().name(),
+            "gain": gain_db(input.gain),
+            "port": input.port,
+        });
+    }
     if !device.automation.is_empty() {
         value["automation"] = device
             .automation
@@ -600,6 +609,92 @@ fn device_json(path: &[usize], device: &Device) -> Value {
             .collect();
     }
     value
+}
+
+/// A linear gain in dB, silence as -150.
+fn gain_db(gain: f64) -> f64 {
+    if gain > 0.0 { 20.0 * gain.log10() } else { -150.0 }
+}
+
+/// The built-in devices that read a key; a plug-in reads one through its first auxiliary input.
+pub(crate) const KEYED_BUILTINS: [&str; 1] = ["compressor"];
+
+/// Whether `device` has a sidechain input to read a key with.
+pub fn reads_a_key(device: &Device) -> bool {
+    match &device.kind {
+        DeviceKind::Builtin(id) => KEYED_BUILTINS.contains(&id.as_str()),
+        kind => is_plugin(kind),
+    }
+}
+
+/// `device.setKey {track, device, source, tap?, gain?, port?}`: the device reads `source`'s
+/// signal at `tap` as its key (sidechain), replacing a key it had; `source` "none" removes it
+/// (`docs/spec/sidechain.md` › Commands). Refused for a device without a sidechain input and for a
+/// key that would close a loop. One undo step.
+pub(crate) fn set_key(session: &mut Session, params: &Value) -> Result<Value, CommandError> {
+    if params.get("source").and_then(Value::as_str).is_some_and(|s| s.eq_ignore_ascii_case("none")) {
+        return clear_key(session, params);
+    }
+    let tap = match params.get("tap") {
+        None | Some(Value::Null) => suhina_model::TapPoint::default(),
+        Some(Value::String(name)) => suhina_model::TapPoint::from_name(name)
+            .ok_or_else(|| format!("tap must be preFx, postFx or postFader, got {name:?}"))?,
+        Some(_) => return Err("tap must be preFx, postFx or postFader".into()),
+    };
+    let db = match params.get("gain") {
+        None | Some(Value::Null) => 0.0,
+        Some(_) => Args::new(params).f64("gain")?,
+    };
+    if !(-150.0..=24.0).contains(&db) {
+        return Err(format!("gain must be from -150 to +24 dB, got {db}").into());
+    }
+    let gain = if db <= -150.0 { 0.0 } else { 10f64.powf(db / 20.0) };
+    let port = match params.get("port") {
+        None | Some(Value::Null) => suhina_model::DeviceInput::KEY.to_owned(),
+        Some(Value::String(port)) if !port.trim().is_empty() => port.trim().to_owned(),
+        Some(_) => return Err("port must be a port name".into()),
+    };
+    let source_track = crate::commands::track_at(&session.project, params, "source")?;
+    let source_name = session.project.track(source_track).map(|t| t.name.clone()).unwrap_or_default();
+    let source = session
+        .project
+        .track(source_track)
+        .and_then(|t| t.channel)
+        .ok_or_else(|| format!("track {source_name:?} has no mixer channel to read a key from"))?;
+    let point = suhina_model::SignalPoint::Channel { channel: source, tap };
+    let reader = device_channel(session, params)?.id;
+    if session.project.key_closes_loop(point, reader) {
+        return Err(format!(
+            "a key from {source_name:?} would close a loop: it plays into this track, or is this track after its devices"
+        )
+        .into());
+    }
+    let channel = device_channel(session, params)?;
+    let path = device_path(&channel.devices, params, "device")?;
+    let device = device_at_mut(&mut channel.devices, &path).ok_or("the device is missing")?;
+    if !reads_a_key(device) {
+        return Err(format!("{} has no sidechain input", device.name).into());
+    }
+    // The engine reads keys for a channel's own devices, not inside a device group
+    // (`docs/spec/sidechain.md` › Device groups).
+    if path.len() > 1 {
+        return Err(format!("{} is inside a device group, where a sidechain is not read yet", device.name).into());
+    }
+    device.inputs = vec![suhina_model::DeviceInput { port: port.clone(), source: point, gain }];
+    Ok(json!({
+        "device": path_value(&path),
+        "key": { "track": source_track.0, "channel": source.0, "tap": tap.name(), "gain": db, "port": port },
+    }))
+}
+
+/// `device.clearKey {track, device}`: the device reads its own input again. One undo step.
+pub(crate) fn clear_key(session: &mut Session, params: &Value) -> Result<Value, CommandError> {
+    let channel = device_channel(session, params)?;
+    let path = device_path(&channel.devices, params, "device")?;
+    let device = device_at_mut(&mut channel.devices, &path).ok_or("the device is missing")?;
+    let had = !device.inputs.is_empty();
+    device.inputs.clear();
+    Ok(json!({ "device": path_value(&path), "cleared": had }))
 }
 
 pub(crate) fn is_plugin(kind: &DeviceKind) -> bool {
@@ -1126,6 +1221,33 @@ pub(crate) fn set_enabled(session: &mut Session, params: &Value) -> Result<Value
     Ok(json!({ "device": path_value(&path), "enabled": enabled }))
 }
 
+/// The longest name `device.rename` takes, in characters.
+pub(crate) const MAX_DEVICE_NAME: usize = 200;
+
+/// `device.rename {track, device, name}`: the name the panel, the menus and an editor's window
+/// show. A plug-in keeps its own name the first time it is renamed (`Device::plugin_name`), as
+/// finding it among the installed plug-ins goes by that name. One undo step.
+pub(crate) fn rename(session: &mut Session, params: &Value) -> Result<Value, CommandError> {
+    let name = Args::new(params).raw_str("name").map(str::trim).filter(|n| !n.is_empty());
+    let name = name.ok_or("name must be a text, not empty")?.to_string();
+    if name.chars().count() > MAX_DEVICE_NAME {
+        return Err(format!("name must be at most {MAX_DEVICE_NAME} characters").into());
+    }
+    let channel = device_channel(session, params)?;
+    let path = device_path(&channel.devices, params, "device")?;
+    let device = device_at_mut(&mut channel.devices, &path).ok_or("the device is missing")?;
+    let kept = device.extensions.0.iter().any(|e| e.format == "suhina" && e.key == Device::PLUGIN_NAME);
+    if is_plugin(&device.kind) && !kept && device.name != name {
+        device.extensions.0.push(suhina_model::Extension {
+            format: "suhina".into(),
+            key: Device::PLUGIN_NAME.into(),
+            data: device.name.as_bytes().to_vec(),
+        });
+    }
+    device.name.clone_from(&name);
+    Ok(json!({ "device": path_value(&path), "name": name }))
+}
+
 /// `device.setEnabledMany {track, devices, enabled}`: several devices of a track on or off, one
 /// undo step (0 or an on/off button with several devices picked, #948).
 pub(crate) fn set_enabled_many(session: &mut Session, params: &Value) -> Result<Value, CommandError> {
@@ -1582,12 +1704,10 @@ pub(crate) fn keep_plugin_params_in_step(session: &mut Session) -> bool {
         let monitor = p.monitor();
         (monitor.running(), monitor.beat())
     });
-    // The parameters that take steps: their lanes hold each value, and so do the echoes of it.
-    let stepped: Vec<(u64, u32)> = edits
-        .iter()
-        .filter(|(key, id, _)| session.plugins.stepped(*key, *id))
-        .map(|(key, id, _)| (*key, *id))
-        .collect();
+    // How each parameter plays its lane: a switch or a list of choices holds each value, and so
+    // do the echoes of it; a knob listed with steps echoes the step the plug-in rounded to.
+    let stepped: Vec<(u64, u32, Echo)> =
+        edits.iter().filter_map(|(key, id, _)| Some((*key, *id, session.plugins.echo(*key, *id)?))).collect();
     let before = turns_lanes_off(&session.project, &edits, at, &stepped).then(|| session.project.clone());
     // The parameters moved by hand, for the window to show in their tracks' lanes.
     for touched in touched_by_hand(&session.project, &edits, at, &stepped) {
@@ -1620,7 +1740,7 @@ pub(crate) fn touched_by_hand(
     project: &Project,
     edits: &[(u64, u32, f64)],
     at: Option<(bool, f64)>,
-    stepped: &[(u64, u32)],
+    stepped: &[(u64, u32, Echo)],
 ) -> Vec<(suhina_model::TrackId, usize, u32)> {
     let devices = suhina_engine::plugin_devices(project);
     let mut touched = Vec::new();
@@ -1629,12 +1749,28 @@ pub(crate) fn touched_by_hand(
         let (Some(track), [index]) = (found.track, found.path.as_slice()) else { continue };
         let echo = plugin_device(project, &devices, *key)
             .and_then(|device| playing_lane(device, *id))
-            .is_some_and(|lane| lane_sent(lane, *value, at, stepped.contains(&(*key, *id))));
+            .is_some_and(|lane| lane_sent(lane, *value, at, echo_of(stepped, *key, *id)));
         if !echo && !touched.contains(&(track, *index, *id)) {
             touched.push((track, *index, *id));
         }
     }
     touched
+}
+
+/// How a plug-in parameter plays its lane, for its reports to be matched with what the lane sent
+/// ([`crate::rack::Rack::echo`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum Echo {
+    /// A switch or a list of choices: each value holds until the next point.
+    Holds,
+    /// A knob listed with steps of this size (#1482): it moves along the line and the plug-in
+    /// may report the step it rounded the lane's value to.
+    Step(f64),
+}
+
+/// How parameter `id` of the plug-in device `key` plays its lane, as `stepped` lists it.
+fn echo_of(stepped: &[(u64, u32, Echo)], key: u64, id: u32) -> Option<Echo> {
+    stepped.iter().find(|(k, i, _)| *k == key && *i == id).map(|(_, _, echo)| *echo)
 }
 
 /// The enabled lane with points that plays plug-in parameter `id` of `device`, if there is one.
@@ -1647,10 +1783,16 @@ fn playing_lane(device: &Device, id: u32) -> Option<&AutomationLane> {
 /// lane sends its value at the playhead; running, a report may come a little after the value it
 /// echoes, so anything the lane went through in the last two beats counts. A `stepped`
 /// parameter's lane holds each value until the next point, as the engine plays it.
-fn lane_sent(lane: &AutomationLane, value: f64, at: Option<(bool, f64)>, stepped: bool) -> bool {
+fn lane_sent(lane: &AutomationLane, value: f64, at: Option<(bool, f64)>, echo: Option<Echo>) -> bool {
     let Some((running, beat)) = at.filter(|(_, b)| b.is_finite()) else { return false };
+    let stepped = echo == Some(Echo::Holds);
+    // A knob listed with steps gets the line's value and plays (and may report) a step of it.
+    let step = match echo {
+        Some(Echo::Step(step)) if step.is_finite() && step > 0.0 => step,
+        _ => 0.0,
+    };
     let played = |b: f64| lane.value_at(b.max(0.0), stepped, &suhina_model::automation::Plain);
-    let near = |a: f64| (a - value).abs() <= 1e-6f64.max(a.abs() * 1e-4);
+    let near = |a: f64| (a - value).abs() <= 1e-6f64.max(a.abs() * 1e-4).max(step);
     if !running {
         return played(beat).is_some_and(near);
     }
@@ -1677,13 +1819,13 @@ fn turns_lanes_off(
     project: &Project,
     edits: &[(u64, u32, f64)],
     at: Option<(bool, f64)>,
-    stepped: &[(u64, u32)],
+    stepped: &[(u64, u32, Echo)],
 ) -> bool {
     let devices = suhina_engine::plugin_devices(project);
     edits.iter().any(|(key, id, value)| {
         plugin_device(project, &devices, *key)
             .and_then(|device| playing_lane(device, *id))
-            .is_some_and(|lane| !lane_sent(lane, *value, at, stepped.contains(&(*key, *id))))
+            .is_some_and(|lane| !lane_sent(lane, *value, at, echo_of(stepped, *key, *id)))
     })
 }
 
@@ -1696,7 +1838,7 @@ pub(crate) fn take_in_param_edits(
     project: &mut Project,
     edits: &[(u64, u32, f64)],
     at: Option<(bool, f64)>,
-    stepped: &[(u64, u32)],
+    stepped: &[(u64, u32, Echo)],
 ) -> (bool, bool) {
     let devices = suhina_engine::plugin_devices(project);
     let mut changed = false;
@@ -1707,8 +1849,8 @@ pub(crate) fn take_in_param_edits(
             continue;
         };
         let Some(device) = suhina_model::device_at_mut(&mut channel.devices, &device.path) else { continue };
-        let held = stepped.contains(&(*key, *id));
-        let by_hand = playing_lane(device, *id).is_some_and(|lane| !lane_sent(lane, *value, at, held));
+        let echo = echo_of(stepped, *key, *id);
+        let by_hand = playing_lane(device, *id).is_some_and(|lane| !lane_sent(lane, *value, at, echo));
         if by_hand {
             off |= crate::automation::override_lane(&mut device.automation, |l| param_id(&l.param) == Some(*id));
         }
@@ -1816,7 +1958,7 @@ pub(crate) fn plugin_params(session: &mut Session, params: &Value) -> Result<Val
                 json!({
                     "id": p.id, "name": p.name, "group": p.group, "min": p.min, "max": p.max,
                     "default": p.default, "value": p.value, "text": p.text, "steps": p.steps,
-                    "automatable": p.automatable, "read_only": p.read_only,
+                    "list": p.list, "automatable": p.automatable, "read_only": p.read_only,
                 })
             })
             .collect(),

@@ -150,6 +150,21 @@ fn theme_json_opts_out_of_the_base_sheet_with_base_none() {
     assert!(odd.base && warnings.iter().any(|w| w.contains("base")), "{warnings:?}");
 }
 
+/// `"color-scheme"` says whether the theme's own values are light or dark; left out, the theme
+/// is dark. It is always written, so the file says which it is; any other value is named.
+#[test]
+fn theme_json_says_its_colour_scheme_and_is_dark_when_it_does_not() {
+    let read = |text: &str| meta::ThemeMeta::parse(text.as_bytes()).unwrap();
+    let (plain, warnings) = read(r#"{ "format": 1, "name": "A", "swatch": "red" }"#);
+    assert!(!plain.light && warnings.is_empty());
+    assert!(plain.to_json().contains(r#""color-scheme": "dark""#), "{}", plain.to_json());
+    let (light, warnings) = read(r#"{ "format": 1, "name": "A", "swatch": "red", "color-scheme": "light" }"#);
+    assert!(light.light && warnings.is_empty(), "{warnings:?}");
+    assert_eq!(read(&light.to_json()), (light, Vec::new()));
+    let (odd, warnings) = read(r#"{ "format": 1, "name": "A", "swatch": "red", "color-scheme": "dim" }"#);
+    assert!(!odd.light && warnings.iter().any(|w| w.contains("color-scheme")), "{warnings:?}");
+}
+
 #[test]
 fn the_swatch_must_resolve_to_a_colour_for_every_variant() {
     let with = |swatch: &str, variant: &str| {
@@ -274,7 +289,8 @@ fn the_user_agent_sheet_selects_by_name_state_and_attribute_only() {
     assert!(!USER_AGENT_SHEET.contains("var("), "the user-agent sheet uses no variables");
     assert!(!USER_AGENT_SHEET.contains("--"), "the user-agent sheet declares no custom properties");
     assert!(!USER_AGENT_SHEET.contains('@'), "the user-agent sheet has no at-rules");
-    let mut text = USER_AGENT_SHEET.to_owned();
+    // One line ending whatever the checkout makes of the file.
+    let mut text = USER_AGENT_SHEET.replace("\r\n", "\n");
     while let Some(start) = text.find("/*") {
         let end = text[start..].find("*/").unwrap() + start + 2;
         text.replace_range(start..end, "");
@@ -352,12 +368,12 @@ fn colour_property(name: &str) -> bool {
     name == "color" || name.ends_with("-color")
 }
 
-/// The user-agent sheet's only colours are the window's plain text and background (#1448): a
-/// theme that opts out of the base sheet stands on a bare floor it can read. Both are fixed, opaque
-/// values given to `window` alone. The theme swatch's square takes its colour from its element,
+/// The user-agent sheet's only colours are the window's plain text and background, and the same
+/// opaque background for the menus, pop-ups and dialogs over it (#1448): a theme that opts out of
+/// the base sheet stands on a bare floor it can read. All are fixed, opaque values. The theme swatch's square takes its colour from its element,
 /// not from the sheet.
 #[test]
-fn the_user_agent_sheet_colours_only_the_window() {
+fn the_user_agent_sheet_colours_only_the_window_and_what_floats_over_it() {
     let sheet = suhina_style::sheet::Sheet::parse(USER_AGENT_SHEET).unwrap();
     let mut given: Vec<&str> = Vec::new();
     for (name, value) in sheet.declarations().filter(|(name, _)| colour_property(name)) {
@@ -375,8 +391,9 @@ fn the_user_agent_sheet_colours_only_the_window() {
     }
     given.sort_unstable();
     assert_eq!(given, ["background-color", "color"]);
-    // Both in the one rule for `window`.
-    let mut text = USER_AGENT_SHEET.to_owned();
+    // The text in a rule for `window`, the background in one for it and what floats over it.
+    // One line ending whatever the checkout makes of the file.
+    let mut text = USER_AGENT_SHEET.replace("\r\n", "\n");
     while let Some(start) = text.find("/*") {
         let end = text[start..].find("*/").unwrap() + start + 2;
         text.replace_range(start..end, "");
@@ -395,7 +412,7 @@ fn the_user_agent_sheet_colours_only_the_window() {
         }
         rest = &rest[close + 1..];
     }
-    assert_eq!(coloured, ["window"]);
+    assert_eq!(coloured, ["window", "window,\npopup,\nmenu,\ndialog"]);
 }
 
 /// No colour in the base sheet is fixed (#1448): every colour it gives reads a variable, so a
@@ -491,4 +508,22 @@ fn image_rules_read_selector_lists_and_skip_comments_and_at_rules() {
                @import \"more.css\";
                f { image: url(f.svg); }";
     assert_eq!(image_rules(css), vec![("e".to_owned(), "e.svg".to_owned()), ("f".to_owned(), "f.svg".to_owned())]);
+}
+
+/// A theme's background may be a JPEG or a WebP photo as well as a PNG, whose first bytes must
+/// say the kind its name does (#1487 F1).
+#[test]
+fn a_jpeg_or_webp_background_is_read_when_its_bytes_say_so() {
+    let jpeg = [0xFF, 0xD8, 0xFF, 0xE0, 0, 0x10].to_vec();
+    let webp = b"RIFF\x10\x00\x00\x00WEBPVP8L".to_vec();
+    for (path, bytes) in [("photo.jpg", &jpeg), ("photo.jpeg", &jpeg), ("photo.webp", &webp)] {
+        let mut files = theme();
+        files.insert(path.into(), bytes.clone());
+        assert!(validate(&files).is_ok(), "{path}");
+    }
+    let mut files = theme();
+    files.insert("photo.jpg".into(), webp.clone());
+    assert!(validate(&files).unwrap_err().contains("not a JPEG image"));
+    assert_eq!(picture("art/photo.webp"), Some("WebP"));
+    assert_eq!(picture("art/photo.gif"), None);
 }

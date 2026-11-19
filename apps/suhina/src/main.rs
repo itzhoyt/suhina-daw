@@ -13,7 +13,7 @@
 //! and folder dialogs (`rfd`) that the window's **Browse…** buttons ask for and hands back the path
 //! chosen, and forgets a recent project the start panel takes off the list; loads and saves the
 //! settings, keymap and theme files (a theme file saved elsewhere is read again; theme backups and
-//! the theme template are zips in `exports/`, and theme files or zips dropped on the window are
+//! exported themes are written to `exports/`, and theme files or zips dropped on the window are
 //! added); opens the MIDI inputs the settings leave on. On macOS `mac_menu.rs` builds the system's
 //! menu bar from the window's menus (`ui::app::menus`) and keeps it in step every frame; a pick
 //! runs the same item as the window's bar. With the GPU renderer the window is asked to be
@@ -735,15 +735,16 @@ impl Window {
         }
     }
 
-    /// Opens a Live Set in a new tab or in place of the active project: imports it, decodes its
+    /// Opens a project in a new tab or in place of the active project: imports it, decodes its
     /// audio and starts playing it, stopped.
     fn open(&mut self, path: &Path, how: OpenAs) {
         // A theme package (a double-click on it, or handed over by a second start) is brought in.
-        if suhina_ui::app::is_theme_package(path) {
+        // A zipped project asks where to unpack it first (the app's prompt), then opens from there.
+        if suhina_ui::app::is_theme_package(path) || path.extension().is_some_and(|e| e.eq_ignore_ascii_case("zip")) {
             self.app.request_open(path.to_path_buf());
             return;
         }
-        match Session::open_with_base(path, Some(&documents_base())) {
+        match self.app.projects_mut().open_path(path, suhina_session::OpenOptions { audio: false }) {
             Ok((session, warnings)) => {
                 if self.show_session(session, warnings, how) {
                     self.remember(path);

@@ -73,6 +73,7 @@ mod meters_tests;
 mod metronome;
 #[cfg(test)]
 mod midi_effect_tests;
+mod missing_instrument;
 #[cfg(test)]
 mod node_tests;
 mod plugin;
@@ -81,6 +82,7 @@ mod plugin_params;
 mod plugin_params_tests;
 #[cfg(test)]
 mod plugin_tests;
+mod pool;
 mod preview;
 #[cfg(test)]
 mod preview_tests;
@@ -132,6 +134,11 @@ pub use plugin::{
     Sent, SongPosition, plugin_devices, plugin_key,
 };
 pub use plugin_params::{MAX_BLOCK_PARAMS, ParamEvent, RAMP_STEP, param_id};
+pub use pool::{
+    MAX_RENDER_THREADS, PARALLEL_MIN, PoolKind, RENDER_THREADS_VAR, RenderPool, automatic_render_threads,
+    process_render_threads, render_threads_for, render_threads_from, render_threads_from_env,
+    set_process_render_threads,
+};
 pub use preview::{PreviewMonitor, PreviewNote, PreviewNotes, preview_notes};
 pub use record::{
     RECORD_CHUNK, RECORD_CHUNKS, RECORD_NOTES, RecordReceiver, RecordedAudio, RecordedJump, RecordedNote,
@@ -505,8 +512,13 @@ pub struct Renderer {
     /// Stretch underruns counted by graphs swapped out.
     underruns_before: u64,
     metronome: metronome::Metronome,
+    /// A track with no instrument plays its notes as sine tones (#1384). On for the engine's own
+    /// renders and tests; the session sets it from the user's setting, off by default.
+    implicit_tones: bool,
     /// The frame of the current block being rendered, for events sent to device chains.
     block_frame: usize,
+    /// The song as each recent block started, read by plug-ins that hear their sound late.
+    songs: plugin::SongHistory,
     /// Rendering offline: plug-ins are waited for without a real-time deadline (ADR 0006).
     offline: bool,
     /// The last frame written, and the step a new graph made from it, eased away over
@@ -516,6 +528,9 @@ pub struct Renderer {
     /// What the device has queued ahead of the next block and how much it takes at once, in
     /// frames ([`Renderer::set_render_lead`]): how long the block's plug-ins may take.
     render_lead: Option<(usize, usize)>,
+    /// When the device last took frames ([`Renderer::set_last_take`]): its next take, a device
+    /// period later, is when the first complete queued period runs out.
+    last_take: Option<Instant>,
     #[cfg(test)]
     observed_deadlines: (usize, [Option<Instant>; 2]),
     /// What is known about the project's plug-in devices, for the graphs built after edits.
@@ -535,6 +550,9 @@ pub struct Renderer {
     cpu: cpu::CpuMeter,
     /// The level meters, published to the controller's `MeterMonitor`.
     meters: meters::MeterWriter,
+    /// The render workers that run chains without plug-ins beside the render thread
+    /// ([`pool`]): its lane of the process's pool; `None` renders on the render thread alone.
+    pool: Option<pool::Lane>,
 }
 
 /// What a render plays besides the project (#764 › 3): what makes its devices (#1147), the
@@ -739,10 +757,13 @@ impl Renderer {
             swap: swap::SwapState::default(),
             underruns_before: 0,
             metronome: metronome::Metronome::new(sample_rate),
+            implicit_tones: true,
             block_frame: 0,
+            songs: plugin::SongHistory::new(sample_rate),
             offline: false,
             declick: Declick::default(),
             render_lead: None,
+            last_take: None,
             #[cfg(test)]
             observed_deadlines: (0, [None; 2]),
             plugin_info: plugins.info,
@@ -754,17 +775,75 @@ impl Renderer {
             recorder: record::Recorder::new(),
             cpu: cpu::CpuMeter::new(),
             meters,
+            pool: pool::process_lane(sample_rate, pool::PoolKind::RealTime),
         })
+    }
+
+    /// Renders each block on `threads` threads, the render thread included (0 or 1: the render
+    /// thread alone), at most [`MAX_RENDER_THREADS`]. The output is the same, bit for bit, for
+    /// any number. The threads are a pool of the renderer's own, apart from the process's
+    /// (tests, diagnosis); a renderer is built with a lane of the process's pool
+    /// ([`set_process_render_threads`], `SUHINA_RENDER_THREADS`). Starts or stops threads:
+    /// never call it on the render thread.
+    pub fn set_render_threads(&mut self, threads: usize) {
+        let threads = threads.clamp(1, MAX_RENDER_THREADS);
+        if self.render_threads() == threads {
+            return;
+        }
+        self.pool = None;
+        self.pool = pool::RenderPool::new(threads - 1, self.pool_kind()).and_then(|pool| pool.lane(self.sample_rate));
+    }
+
+    /// The threads that render each block, the render thread included.
+    pub fn render_threads(&self) -> usize {
+        self.pool.as_ref().map_or(1, pool::Lane::threads)
+    }
+
+    /// Asks the render workers to join real-time priority for blocks of `frames` frames, as the
+    /// render thread does: call it when the renderer starts playing to a device. Never
+    /// allocates.
+    pub fn join_real_time(&self, frames: usize) {
+        if let Some(pool) = self.pool.as_ref() {
+            pool.join_real_time(frames, self.sample_rate);
+        }
     }
 
     pub fn sample_rate(&self) -> u32 {
         self.sample_rate
     }
 
+    /// Whether a track with no instrument of its own plays its notes as sine tones (#1384), as
+    /// [`LaunchCommand::SetImplicitTones`] sets it while playing: on until set.
+    pub fn set_implicit_tones(&mut self, on: bool) {
+        self.implicit_tones = on;
+        for chain in &mut self.graph.chains {
+            chain.tones_off = !on;
+        }
+    }
+
     /// Renders offline from now on: plug-ins are waited for as long as they take (up to
     /// [`OFFLINE_TIMEOUT`] a block) instead of until the block's real-time deadline.
+    ///
+    /// An offline renderer renders on the process's offline pool, at normal priority, and a
+    /// renderer that plays on its real-time pool (ADR 0038 › 1): turning it offline gives its
+    /// lane back and takes one of the other pool, so call it before the first block, never on
+    /// the render thread.
     pub fn set_offline(&mut self, offline: bool) {
         self.offline = offline;
+        let kind = self.pool_kind();
+        if self.pool.as_ref().is_some_and(|lane| lane.kind() != kind) {
+            let threads = self.render_threads();
+            self.pool = None;
+            self.pool = pool::process_lane(self.sample_rate, kind).filter(|lane| lane.threads() == threads);
+            if self.pool.is_none() && threads > 1 {
+                self.pool = pool::RenderPool::new(threads - 1, kind).and_then(|pool| pool.lane(self.sample_rate));
+            }
+        }
+    }
+
+    /// The pool a renderer of this kind renders on: offline renders at normal priority.
+    fn pool_kind(&self) -> pool::PoolKind {
+        if self.offline { pool::PoolKind::Offline } else { pool::PoolKind::RealTime }
     }
 
     /// Whether playback repeats the project's loop region when it is on (the default). A render
@@ -865,6 +944,16 @@ impl Renderer {
         self.render_lead = Some((queued, device));
     }
 
+    /// When the device last took frames from the output (its last callback), `None` before its
+    /// first. With it the block's plug-ins may also take what is left until the device's next
+    /// take, which the queued periods start from: a shallow queue (an armed track keeps one
+    /// block) is empty after every take, and without it each block had only half its playing
+    /// time, though the device needs it a whole period later (#1494). A take more than a period
+    /// ago is overdue and adds nothing. Call it with [`Renderer::set_render_lead`].
+    pub fn set_last_take(&mut self, at: Option<Instant>) {
+        self.last_take = at;
+    }
+
     pub fn set_live_clock(&mut self, now: u64, delay: u32) {
         self.live.set_clock(now, delay, self.transport.position);
     }
@@ -894,8 +983,8 @@ impl Renderer {
         self.graph.launcher.monitor.plugin_misses.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Publishes the plug-in blocks missed so far and the plug-in that missed most. Never
-    /// allocates.
+    /// Publishes the plug-in blocks missed so far and the plug-in that missed most, and the
+    /// blocks render workers missed and the track that missed most. Never allocates.
     fn publish_plugin_misses(&mut self) {
         let (mut total, mut blocked, mut worst) = (0u64, 0u64, (0u64, 0u64));
         let mut worst_trip = 0u32;
@@ -909,7 +998,19 @@ impl Renderer {
                 }
             }
         }
+        // Blocks a chain came back from a render worker late (ADR 0038 › 3), and the track that
+        // missed most.
+        let (mut late, mut worst_track) = (0u64, (0u64, 0u64));
+        for chain in &self.graph.chains {
+            late = late.saturating_add(chain.missed_blocks);
+            if chain.missed_blocks > worst_track.1 {
+                worst_track = (u64::from(chain.track.0), chain.missed_blocks);
+            }
+        }
         let monitor = &self.graph.launcher.monitor;
+        monitor.render_misses.store(late, std::sync::atomic::Ordering::Relaxed);
+        monitor.worst_render_track.store(worst_track.0, std::sync::atomic::Ordering::Relaxed);
+        monitor.worst_render_misses.store(worst_track.1, std::sync::atomic::Ordering::Relaxed);
         monitor.plugin_misses.store(total, std::sync::atomic::Ordering::Relaxed);
         monitor.plugin_blocked.store(blocked, std::sync::atomic::Ordering::Relaxed);
         monitor.worst_trip.store(worst_trip, std::sync::atomic::Ordering::Relaxed);
@@ -940,8 +1041,15 @@ impl Renderer {
                 scale: event.scale,
                 arranged: true,
             };
-            let Self { voices, graph, transport: crate::transport::Transport { position, .. }, sample_rate, .. } = self;
-            start_note(voices, &mut graph.chains, frame, *position, *sample_rate, end, start);
+            let Self {
+                voices,
+                graph,
+                transport: crate::transport::Transport { position, .. },
+                sample_rate,
+                implicit_tones,
+                ..
+            } = self;
+            start_note(voices, &mut graph.chains, frame, *position, *sample_rate, end, start, *implicit_tones);
         }
     }
 
@@ -1077,12 +1185,22 @@ impl Renderer {
             // until the following callback to supply more. Only a partial period
             // is discounted; subtracting a whole period starves return effects
             // every time a large callback drains the ring to exactly one period.
-            // Keep a margin. A partially primed ring still gives half a batch;
-            // otherwise use its actual reserve, including for a brief start burst.
+            // The queued periods play from the device's next take, a period after its last
+            // one: what is left until then is the block's too (#1494), its share of it when
+            // that take needs more frames than this block (a device period longer than the
+            // block), so the blocks after it still have theirs. Keep a margin. A
+            // partially primed ring still gives half a batch; otherwise use its actual
+            // reserve, including for a brief start burst.
             Some((queued, device)) => {
                 let period = device.max(1);
                 let covered = queued / period * period;
-                let room = covered as f64 / rate - LEAD_MARGIN_SECONDS;
+                let missing = (period - (queued - covered)).max(1);
+                let share = (frames as f64 / missing as f64).min(1.0);
+                let to_next_take = self.last_take.map_or(0.0, |took| {
+                    let since = now.saturating_duration_since(took).as_secs_f64();
+                    (period as f64 / rate - since).max(0.0) * share
+                });
+                let room = covered as f64 / rate + to_next_take - LEAD_MARGIN_SECONDS;
                 room.max(block * 0.5)
             }
             None => block * DEADLINE_SHARE,
@@ -1187,8 +1305,9 @@ impl Renderer {
                 (seconds(start), seconds(end))
             }),
         };
+        self.songs.record(song, frames);
         for chain in &mut self.graph.chains {
-            chain.transport(&song);
+            chain.transport(&self.songs);
             chain.automate(at, time, frames);
             chain.automate_mix(time, frames, self.transport.running);
         }
@@ -1259,9 +1378,10 @@ impl Renderer {
                         graph,
                         transport: crate::transport::Transport { position, .. },
                         sample_rate,
+                        implicit_tones,
                         ..
                     } = self;
-                    start_note(voices, &mut graph.chains, frame, *position, *sample_rate, end, start);
+                    start_note(voices, &mut graph.chains, frame, *position, *sample_rate, end, start, *implicit_tones);
                 }
             }
 
@@ -1331,7 +1451,7 @@ impl Renderer {
             keep: &capture.keep,
             buffer: &mut capture.buffer,
         });
-        sends::run(&mut self.graph.chains, out, &mut self.cue.bus, frames, &context, capture);
+        sends::run(&mut self.graph.chains, out, &mut self.cue.bus, frames, &context, capture, self.pool.as_mut());
         // The main fader's move since the graph was built, then the click it leaves alone. With
         // the fader still, the click is in the mix already and this changes nothing.
         if let Some((_, fader)) = self.graph.main_fader.as_ref()
@@ -1603,7 +1723,9 @@ pub(crate) fn bus_chain(chains: &mut [Chain], bus: u32) -> Option<&mut Chain> {
 
 /// Starts a note at renderer frame `position` (`frame` of the block) that ends at frame `end`:
 /// on the track's instrument when its chain starts with one, otherwise as a sine voice, stealing
-/// the oldest voice when all are busy.
+/// the oldest voice when all are busy. A track with no instrument of its own is silent while the
+/// renderer does not play the implicit tones (`tones`, #1384).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn start_note(
     voices: &mut [Voice; MAX_VOICES],
     chains: &mut [Chain],
@@ -1612,13 +1734,20 @@ pub(crate) fn start_note(
     sample_rate: u32,
     end: u64,
     note: NoteStart,
+    tones: bool,
 ) {
     if let Some(chain) = bus_chain(chains, note.bus).filter(|c| c.instrument) {
+        if chain.implicit_tones && !tones {
+            return;
+        }
         chain.set_scale(frame, note.scale);
         chain.note_on(frame, position, note.key, note.velocity, end);
         if note.arranged {
             chain.mark_arranged(note.key);
         }
+        return;
+    }
+    if !tones {
         return;
     }
     let slot = match voices.iter().position(|v| !v.active) {
@@ -1849,19 +1978,24 @@ fn heard_with_solo(project: &Project, channel: &suhina_model::Channel, chain: &[
         return true;
     }
     let on_chain = project.channels.iter().any(|c| soloed(c) && chain.contains(&c.id));
-    // A group sounds when something soloed plays into it.
-    let feeds_it = project.channels.iter().filter(|c| soloed(c)).any(|c| {
-        let mut next = c.output;
-        for _ in 0..64 {
-            match next {
-                Some(id) if id == channel.id => return true,
-                Some(id) => next = project.channel(id).and_then(|o| o.output),
-                None => return false,
-            }
-        }
-        false
-    });
-    on_chain || feeds_it
+    // Solo follows primary outputs and audible sends in either direction, keeping a
+    // shared destination alive without soloing unrelated sources feeding that destination.
+    let edges: Vec<_> = project
+        .channels
+        .iter()
+        .flat_map(|c| {
+            c.output
+                .into_iter()
+                .chain(c.sends.iter().filter(|s| s.level.is_finite() && s.level > 0.0).map(|s| s.target))
+                .map(move |target| (c.id, target))
+        })
+        .collect();
+    on_chain
+        || project
+            .channels
+            .iter()
+            .filter(|c| soloed(c))
+            .any(|c| sends::reaches(&edges, c.id, channel.id) || sends::reaches(&edges, channel.id, c.id))
 }
 
 /// Adds the notes of one content lane, as placed by `clip`, to `events`. Notes outside the clip's
@@ -1886,8 +2020,9 @@ fn collect_notes(
     }
     let to_frame = |beats: f64| tempo::frame_of(map, beats);
 
-    // Each pass maps the content range [from, to) to the clip position `at`.
-    let mut push_range = |from: f64, to: f64, at: f64| {
+    // Each pass maps the content range [from, to) to the clip position `at`; `pass` counts the
+    // passes through the loop from 0, for the notes' rolled velocities (ADR 0037).
+    let mut push_range = |from: f64, to: f64, at: f64, pass: u64| {
         for note in notes {
             // A muted note stays in the clip and produces no event at all, exactly as if it were
             // not there (ADR 0001 › Amendment: muted notes).
@@ -1911,15 +2046,19 @@ fn collect_notes(
                 continue;
             }
             let end = (start + length).min(clip_end);
+            // A note's velocity range is rolled here, for each pass, in the one render path
+            // (ADR 0037): offline and live lay out the same notes.
+            let place = suhina_model::RollPlace { track: track.0, clip: clip.start.to_bits(), pass };
+            let velocity = note_velocity(suhina_model::played_velocity(note, place));
             events.push(ArrangedNote {
                 start: to_frame(start),
                 end: to_frame(end),
                 frequency: 440.0 * 2f64.powf((f64::from(note.key) - 69.0) / 12.0),
                 key: note.key.min(127),
-                velocity: note_velocity(note.velocity),
+                velocity,
                 track,
-                gain_left: gain_left * note_velocity(note.velocity),
-                gain_right: gain_right * note_velocity(note.velocity),
+                gain_left: gain_left * velocity,
+                gain_right: gain_right * velocity,
                 column,
                 bus,
                 meter,
@@ -1933,17 +2072,17 @@ fn collect_notes(
             let loop_len = range.end - range.start;
             // First pass from the offset to the loop end, then whole loops until the clip ends.
             let first_from = clip.offset.clamp(range.start, range.end);
-            push_range(first_from, range.end, 0.0);
+            push_range(first_from, range.end, 0.0, 0);
             let mut at = range.end - first_from;
             let max_passes = 100_000;
             let mut passes = 0;
             while at < clip.length && passes < max_passes {
-                push_range(range.start, range.end, at);
-                at += loop_len;
                 passes += 1;
+                push_range(range.start, range.end, at, passes);
+                at += loop_len;
             }
         }
-        _ => push_range(clip.offset, f64::INFINITY, 0.0),
+        _ => push_range(clip.offset, f64::INFINITY, 0.0, 0),
     }
 }
 

@@ -126,7 +126,6 @@ pub const GROUP_IDS: &[&str] = &[
     "app-bar-start",
     "app-bar-centre",
     "app-bar-end",
-    "piano-roll-rows",
     "mixer-body",
     "mixer-output",
     "mixer-input",
@@ -311,7 +310,7 @@ pub const ELEMENTS: &[Element] = &[
     element("session", Region, "The Launcher view: tracks as columns of clip slots.")
         .parts(&["track-column", "scene-column"])
         .settings(&["track-width", "return-width", "scene-width", "slot-height", "header-height"]),
-    element("track-column", Container, "A track's column in the Launcher view.")
+    element("track-column", Container, "A track's column in the Launcher view; its background is drawn under its slots. While `[selected]`, what that state changes in its background is drawn over the whole column, header, slots and mixer strip, so give `track-column[selected]` a translucent one.")
         .attributes(&["color", "selected", "muted"])
         .settings(&["track-artwork"]),
     element("scene-column", Part, "The column of scenes at the Launcher view's side."),
@@ -327,7 +326,7 @@ pub const ELEMENTS: &[Element] = &[
     element("slot-record", Control, "The record button in an armed track's empty slot, `[recording]` while that slot records: its `color` for the dot and the word, its `background-color` over the slot while it records.")
         .attributes(&["recording"]),
     element("slot-mark", Drawn, "The mark in an empty slot that holds a stop button."),
-    element("drop-target", Drawn, "Where a drop lands: the outline of the area (`kind=\"area\"`) or the line a moved track goes to (`kind=\"insert\"`).")
+    element("drop-target", Drawn, "Where a drop lands: the outline of the area (`kind=\"area\"`), the line a moved track goes to (`kind=\"insert\"`), or the slot with a + after a chain's last device (`kind=\"append\"`).")
         .attributes(&["kind"]),
     element("arrangement", Region, "The Arrangement view: tracks as rows along a timeline. Its `background-color` is the colour under the grid and the empty lanes; `arrangement[kind=\"panel\"]`'s is the one under its ruler, rows, headers and toolbar, and both are what the view draws over a region around it that has a background of its own.")
         .parts(&[
@@ -372,7 +371,7 @@ pub const ELEMENTS: &[Element] = &[
     element(
         "track-lane",
         Container,
-        "A track's row of clips in the Arrangement view, its clips inside it, `[checked]` while the piano roll edits it alone. Its background is painted over the grid lines, so give it a translucent one.",
+        "A track's row of clips in the Arrangement view, its clips inside it, `[selected]` while its track is selected and `[checked]` while the piano roll edits it alone. Its background is painted over the grid lines, so give it a translucent one.",
     )
     .parts(&["clip"])
     .attributes(&["color", "selected", "muted", "checked"]),
@@ -412,9 +411,9 @@ pub const ELEMENTS: &[Element] = &[
         .attributes(&["selected", "kind"]),
     element("automation-lane", Drawn, "The time of a group of automation lanes, `automation-lane[kind=\"group\"]`: its `background-color`.")
         .attributes(&["kind"]),
-    element("automation-line", Drawn, "An automation lane's envelope, the track's colour by default; `[muted]` while it is off.")
-        .attributes(&["muted"]),
-    element("automation-point", Drawn, "A point of an automation envelope, `[selected]` while it is picked.").attributes(&["selected"]),
+    element("automation-line", Drawn, "An automation lane's envelope, the track's colour by default; `[kind=\"fixed\"]` while Settings colours every envelope alike, `[muted]` while it is off.")
+        .attributes(&["muted", "kind"]),
+    element("automation-point", Drawn, "A point of an automation envelope, the line's colour by default; `[kind=\"fixed\"]` while Settings colours every envelope alike, `[selected]` while it is picked.").attributes(&["selected", "kind"]),
     element("automation-pin", Drawn, "The pin of an automation lane pinned below its track's top lane."),
     element("marker", Control, "A marker's tag in the row under the loop: its background, its line's `border-color` and its name's `color`; `[checked]` while it is dragged.")
         .attributes(&["checked"]),
@@ -583,11 +582,18 @@ pub const ELEMENTS: &[Element] = &[
         .ids(Ids::Prefixed("mixer-send-"))
         .settings(VALUE_SETTINGS)
         .artwork(&[own("send"), own("send.fill"), own("send.knob.body"), own("send.knob.pointer")]),
-    element("knob", Control, "A knob; the dial of a device canvas (the reverb's and the delay's) is `knob[kind=\"dial\"]`.")
-        .parts(&["knob-body", "knob-pointer", "knob-ring"])
-        .attributes(&["kind"])
+    element(
+        "knob",
+        Control,
+        "A knob; the dial of a device canvas (the reverb's and the delay's) is `knob[kind=\"dial\"]`; a device panel's own knob face is never replaced.",
+    )
+    .parts(&["knob-body", "knob-pointer", "knob-ring"])
+    .attributes(&["kind"])
         .settings(VALUE_SETTINGS)
-        .artwork(&[default_svg!("knob.body", "knob-body"), default_svg!("knob.pointer", "knob-pointer")]),
+        .artwork(&[
+            default_svg!("knob.body", "knob-body"),
+            default_svg!("knob.pointer", "knob-pointer"),
+        ]),
     element("knob-body", Part, "A knob's body; its artwork takes its `color`."),
     element("knob-pointer", Part, "A knob's pointer, turned to its value; its artwork takes its `color`."),
     element("knob-ring", Part, "The disc between a dial's rim and its inner disc: its `background-color`, where the region the dial is in gives none."),
@@ -614,7 +620,7 @@ pub const ELEMENTS: &[Element] = &[
         .ids(Ids::Listed { prefix: "", names: &["browser-search", "browser-new-folder"] }),
     element("scroll-bar", Drawn, "The mark of how far a row is scrolled, such as a mixer strip's sends or the device chain (`scroll-bar[kind=\"chain\"]`): its `background-color` the track, its `color` the thumb.")
         .attributes(&["kind"]),
-    element("label", Drawn, "A label, its `color` inherited; a scene's number is `label[kind=\"scene-number\"]`. The browser's and the detail panels' words by how much they stand out: dim words `hint`, a control's or a figure's name `caption` (these two take only a colour a rule gives them, not one around them), a panel's title `title`, a value shown as words `value`, a fault `error`, a plug-in's state `plugin-state`, a device's parameter's name `parameter`, a check box's words `check`, words or a mark in the accent (a file found, a key being set, the toolbar editor's grid) `accent`, the light and the dark ink for text on a colour (a clip's, a track's), whichever reads, `on-light` and `on-dark`, and the head of the MIDI tools' figures `head` (`[selected]` while a selection is what they act on, in its `accent-color`). Inside the browser, `hint`, `caption` and `value` take the browser's own colours.")
+    element("label", Drawn, "A label, its `color` inherited; a scene's number is `label[kind=\"scene-number\"]`. The browser's and the detail panels' words by how much they stand out: dim words `hint`, a control's or a figure's name `caption` (these two take only a colour a rule gives them, not one around them), a panel's title `title`, a value shown as words `value`, a fault `error`, a plug-in's state `plugin-state`, a device's parameter's name `parameter`, a check box's words `check`, words or a mark in the accent (a file found, a key being set, the toolbar editor's grid) `accent`, the light and the dark ink for text on a colour (a clip's, a track's), whichever reads, `on-light` and `on-dark`, a plug-in that is ready `ok`, a file that needs attention `warning`, words on a lit fill `inverse`, and the head of the MIDI tools' figures `head` (`[selected]` while a selection is what they act on, in its `accent-color`). Inside the browser, `hint`, `caption` and `value` take the browser's own colours.")
         .attributes(&["kind", "selected"]),
     element("separator", Drawn, "A rule between parts, by its `kind`: the window's lines over and under the views; a divider between a bar's items (`bar`); the Launcher's lines between its bands (`band`), its columns (`column`) and its slots (`slot`); the Arrangement's and the piano roll's under their rows (`row`), between their bands (`band`) and under each lane (`lane`); a line in a clip panel's list (`menu`); the lines over a device inside a device group (`group`); an expanded panel's lines between its columns (`column`); the browser's lines between its parts (`row`); the line under the place of a number a drag steps (`step`, `[selected]` while it is held).")
         .ids(Ids::Listed { prefix: "", names: &["views-top", "views-bottom"] })
@@ -627,12 +633,12 @@ pub const ELEMENTS: &[Element] = &[
     element("progress", Drawn, "A progress bar: a dialog's, the sample map's busy card and the MIDI panel's range bar.").parts(&["progress-fill"]),
     element("progress-fill", Part, "A progress bar's done part, in each of those."),
     // Pages and dialogs.
-    element("settings", Region, "The Settings page.").parts(&["settings-nav"]),
+    element("settings", Region, "The Settings page; docked over the views, `backdrop-filter: blur(<length>)` blurs them behind it.").parts(&["settings-nav"]).settings(FLOATING),
     element("settings-nav", Control, "An entry of the Settings page's list, `[checked]` for the page shown.").attributes(&["checked"]),
     element("dialog", Region, "A dialog.").parts(&["dialog-title", "list-row"]).settings(FLOATING),
     element("dialog-title", Part, "A dialog's title row, with its Close button: its `background-color`, its words `label[kind=\"title\"]`."),
     element("colour-swatch", Control, "A swatch of the colour picker, in a track's or a clip's menu: its `border-color` outlines the chosen one and the one under the pointer, and the square of the colour beside a picker's name, `colour-swatch[kind=\"square\"]`.").attributes(&["kind"]),
-    element("list-row", Control, "A row of a list in a dialog or on the start page that a click picks (a recent project, a template): its `background-color` under the pointer, its `color` for its name. A dialog's row is `list-row[kind=\"dialog\"]`, a row of the Plug-in manager's table `list-row[kind=\"plugin\"]` (its fill while picked and under the pointer) and the colour picker's row beside a name `list-row[kind=\"picker\"]`.").attributes(&["selected", "kind"]),
+    element("list-row", Control, "A row of a list in a dialog or on the start page that a click picks (a recent project, a template): its `background-color` under the pointer, its `color` for its name. A dialog's row is `list-row[kind=\"dialog\"]`, a row of the Plug-in manager's table `list-row[kind=\"plugin\"]` (its fill while picked and under the pointer), a row of the missing files panel's table `list-row[kind=\"missing-file\"]` (the same) and the colour picker's row beside a name `list-row[kind=\"picker\"]`.").attributes(&["selected", "kind"]),
     element("start-page", Region, "The page shown with no project open."),
     element("plugin-manager", Region, "The Plug-in manager."),
     element("export", Region, "The Export audio dialog."),
@@ -642,7 +648,7 @@ pub const ELEMENTS: &[Element] = &[
     element("theme-swatch", Drawn, "A theme's swatch in the theme picker, with a `color` attribute.").attributes(&["color"]),
     element("app-fill", Drawn, "The fill the app's bars, Settings, dialogs and menus paint for themselves where the region behind them gives none: its `background-color`, `app-fill[kind=\"window\"]` behind a dialog and under a backdrop, `[kind=\"panel\"]` for a bar, a card or a dialog's panel, `[kind=\"panel-hover\"]` for a row under the pointer, `[kind=\"control\"]`, `[kind=\"control-hover\"]` and `[kind=\"control-active\"]` for a control the app draws itself, `[kind=\"knob\"]` the knob of a yes/no switch that is on where the window behind it is see-through.")
         .attributes(&["kind"]),
-    element("widget", Drawn, "egui's own widgets (the fields, drop-downs, check boxes and entries of Settings, menus and dialogs, egui's windows) where no rule for `button`, `text-input`, `menu` or `scroll-bar` gives them a colour: its `background-color` and `color` at rest, `:hover`, `:active` and `:disabled` (with its `border-color`), `widget[checked]` the selection's fill and its `accent-color` the selection's outline, `widget[kind=\"window\"]` the fill and edge of egui's windows and menus and of the panels, `widget[kind=\"field\"]` the fill behind a text field. Its words at rest are `--text-value`, where a `button`'s are `--text-primary`.")
+    element("widget", Drawn, "egui's own widgets (the fields, drop-downs, check boxes and entries of Settings, menus and dialogs, egui's windows) where no rule for `button`, `text-input`, `menu` or `scroll-bar` gives them a colour: its `background-color` and `color` at rest, `:hover` and `:active`, `widget[kind=\"static\"]` what egui draws that takes no input (its separators and frames in its `border-color`, its labels in its `color`; no `button` rule reaches it), `widget[checked]` the selection's fill and its `accent-color` the selection's outline, `widget[kind=\"window\"]` the fill and edge of egui's windows and menus and of the panels, `widget[kind=\"field\"]` the fill behind a text field. Its words at rest are `--text-value`, where a `button`'s are `--text-primary`.")
         .attributes(&["checked", "kind"]),
 ];
 

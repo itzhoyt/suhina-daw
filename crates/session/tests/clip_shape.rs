@@ -44,6 +44,7 @@ fn project() -> Project {
 
 fn project_built() -> Project {
     let track = Track {
+        folder: false,
         id: TrackId(1),
         name: "Keys".into(),
         color: None,
@@ -54,9 +55,18 @@ fn project_built() -> Project {
         audio_input: Default::default(),
         midi_input: Default::default(),
     };
-    let note =
-        Note { time: 0.0, duration: 1.0, key: 60, velocity: 0.8, release_velocity: 0.5, channel: 0, muted: false };
+    let note = Note {
+        time: 0.0,
+        duration: 1.0,
+        key: 60,
+        velocity: 0.8,
+        release_velocity: 0.5,
+        channel: 0,
+        muted: false,
+        velocity_range: 0,
+    };
     let content = |id: u32| ClipContent {
+        linked: false,
         id: ContentId(id),
         name: format!("C{id}"),
         length: 4.0,

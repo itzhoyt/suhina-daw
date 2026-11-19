@@ -98,13 +98,6 @@
                     "time": 16.0
                   }
                 ],
-                "warp_settings": {
-                  "envelope": 40.0,
-                  "flux": 60.0,
-                  "grain": 120.0,
-                  "slice": "1/16",
-                  "tail": "back-and-forth"
-                },
                 "warped": true
               },
               "content": 2,
@@ -692,7 +685,8 @@
                 "key": 60,
                 "release_velocity": 0.5,
                 "time": 0.0,
-                "velocity": 0.75
+                "velocity": 0.75,
+                "velocity_range": 20
               },
               {
                 "channel": 15,

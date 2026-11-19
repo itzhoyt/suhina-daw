@@ -3,7 +3,7 @@ description: What the level meters measure (tracks, groups, returns, the main ou
 read_when: level meter, meters, peak, RMS, clip indicator, clipping, peak hold, mixer.levels, mixer.resetClip, MeterMonitor, track header meter, mixer strip meter, dBFS
 type: spec
 status: current
-last_verified: 2026-11-07
+last_verified: 2026-11-18
 covers:
   - crates/engine/src/meters.rs
   - crates/engine/src/meters_tests.rs
@@ -26,8 +26,8 @@ without changing the scale, ballistics or clip reset behaviour.
 - **A track** is measured at its own level: after its own devices, volume and pan, before the
   groups and the main channel it plays through. Turning the main volume or a group's volume down
   does not move a track's meter; turning the track itself down does.
-- **A group** shows the sum of what plays into it, after the group's own volume (and after its
-  devices, when it has them). A group's pan does not apply, as when it is mixed.
+- **A group** shows the sum of what plays into it, after the group's own volume and pan (and
+  after its devices, when it has them), as when it is mixed.
 - **A return track** is measured like a track, from what plays on it.
 - **A track that is not heard** (turned off, or not soloed while others are) reads silence.
 - **The main output** is what the engine hands the audio device: every track through the main
@@ -95,8 +95,8 @@ Sizes and tokens are in [components](../design/components.md) › Meter.
   bars, hold marks, needles, artwork frames and glow together, preserving empty
   native bar rails, the clip light and all measurement geometry. Frame images dim
   as a whole, including any background authored inside them. Canonical CSS
-  `meter { intensity: 65%; }` and the theme editor's Meter intensity slider
-  mirror this value into JSON. This is visual opacity, not audio gain or colour
+  `meter { meter-intensity: 65; }` sets this value; a theme may offer it as a quick
+  control of its own through `var()`. This is visual opacity, not audio gain or colour
   saturation. Advanced `meter-level { opacity: .5; }` additionally dims native
   bars, hold marks and needles as well as CSS fills/glow. An explicitly transparent
   fill suppresses native fill fallback.

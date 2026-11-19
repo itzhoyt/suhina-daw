@@ -163,6 +163,10 @@ pub enum Widget {
         decimals: usize,
         #[serde(default)]
         format: TextFormat,
+        /// The canvas's image asset drawn as the dial's face: the device's own knob, over which
+        /// the host draws the value's arc and the pointer. No theme's knob artwork replaces it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        image: Option<String>,
     },
     Stepper {
         decimals: usize,
@@ -437,9 +441,14 @@ impl Widget {
                 }
                 return out;
             }
-            Self::Dial { label, decimals, format } => {
+            Self::Dial { label, decimals, format, image } => {
                 let label_height = if label.is_empty() { 0. } else { 24. };
-                let r = ((height - label_height - 18.) / 2.).min(w / 2. - 2.).max(1.);
+                let room = ((height - label_height - 18.) / 2.).min(w / 2. - 2.).max(1.);
+                // The rim's width grows with the dial (3 up to a radius of 18), and the dark ring
+                // inside the arc is as wide as the arc, so a big dial keeps its proportions; the
+                // arc's outer edge stays where it was, two units past the room.
+                let rim = (room / 6.).max(3.);
+                let r = (room + 2. - rim / 2.).max(1.);
                 let cx = w / 2.;
                 let cy = label_height + (height - label_height - 18.) / 2.;
                 let angle = UiValue::from(2.35) + UiValue::normalized(id, binding.logarithmic) * 4.7.into();
@@ -452,6 +461,48 @@ impl Widget {
                 if let Draw::Text { format: f, .. } = &mut value {
                     *f = *format;
                 }
+                if let Some(image) = image {
+                    // The device's own face: the track and the value's arc around it in the
+                    // theme's colours, the image inside, the pointer over it.
+                    let face = (r - 3.).max(1.);
+                    let mut out = Vec::with_capacity(6);
+                    if !label.is_empty() {
+                        out.push(caption);
+                    }
+                    out.extend([
+                        Draw::Arc {
+                            center: [cx.into(), cy.into()],
+                            radius: (r - 1.).max(0.).into(),
+                            start: 2.35.into(),
+                            end: 7.05.into(),
+                            color: RIM,
+                            width: 2.,
+                        },
+                        Draw::Arc {
+                            center: [cx.into(), cy.into()],
+                            radius: (r - 1.).max(0.).into(),
+                            start: 2.35.into(),
+                            end: angle.clone(),
+                            color: ACCENT,
+                            width: 2.,
+                        },
+                        Draw::image(image.clone(), [cx - face, cy - face, face * 2., face * 2.]),
+                        Draw::Line {
+                            from: [
+                                UiValue::from(cx) + angle.clone().cos() * (face * 0.3).into(),
+                                UiValue::from(cy) + angle.clone().sin() * (face * 0.3).into(),
+                            ],
+                            to: [
+                                UiValue::from(cx) + angle.clone().cos() * (face * 0.62).into(),
+                                UiValue::from(cy) + angle.sin() * (face * 0.62).into(),
+                            ],
+                            color: TEXT,
+                            width: if r > 20. { 2. } else { 1.5 },
+                        },
+                        value,
+                    ]);
+                    return out;
+                }
                 return vec![
                     caption,
                     Draw::Arc {
@@ -460,12 +511,12 @@ impl Widget {
                         start: 2.35.into(),
                         end: 7.05.into(),
                         color: RIM,
-                        width: 4.,
+                        width: rim,
                     },
-                    Draw::Circle { center: [cx.into(), cy.into()], radius: (r - 2.).max(0.).into(), color: DARK },
+                    Draw::Circle { center: [cx.into(), cy.into()], radius: (r - rim / 2.).max(0.).into(), color: DARK },
                     Draw::Circle {
                         center: [cx.into(), cy.into()],
-                        radius: (r - 6.).max(0.).into(),
+                        radius: (r - rim * 1.5).max(0.).into(),
                         color: [46, 45, 42, 255],
                     },
                     Draw::Line {

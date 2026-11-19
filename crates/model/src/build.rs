@@ -27,11 +27,17 @@ impl Note {
             release_velocity: Self::DEFAULT_RELEASE_VELOCITY,
             channel: 0,
             muted: false,
+            velocity_range: 0,
         }
     }
 }
 
 impl Track {
+    /// A presentation folder groups tracks without an audio mixer channel.
+    pub fn is_folder(&self) -> bool {
+        self.folder && self.channel.is_none()
+    }
+
     /// A track that plays nothing yet, on no channel, outside every group, hearing no input.
     pub fn new(id: TrackId, name: impl Into<String>) -> Self {
         Self {
@@ -43,6 +49,7 @@ impl Track {
             parent: None,
             midi_input: MidiInput::default(),
             audio_input: AudioInput::default(),
+            folder: false,
             extensions: Extensions::default(),
         }
     }
@@ -123,6 +130,8 @@ impl Device {
             params: Vec::new(),
             automation: Vec::new(),
             clip_host: false,
+            inputs: Vec::new(),
+            instrument: false,
             extensions: Extensions::default(),
         }
     }

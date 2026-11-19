@@ -8,13 +8,14 @@ use suhina_model::*;
 const SR: u32 = 48_000;
 
 fn note(time: f64, duration: f64, key: u8) -> Note {
-    Note { time, duration, key, velocity: 1.0, release_velocity: 0.5, channel: 0, muted: false }
+    Note { time, duration, key, velocity: 1.0, release_velocity: 0.5, channel: 0, muted: false, velocity_range: 0 }
 }
 
 fn project_with(lanes: Vec<ContentLane>, clips: Vec<Clip>, tracks: u32) -> Project {
     Project {
         tracks: (1..=tracks)
             .map(|i| Track {
+                folder: false,
                 id: TrackId(i),
                 name: format!("T{i}"),
                 color: None,
@@ -44,6 +45,7 @@ fn project_with(lanes: Vec<ContentLane>, clips: Vec<Clip>, tracks: u32) -> Proje
             })
             .collect(),
         contents: vec![ClipContent {
+            linked: false,
             id: ContentId(1),
             name: "c".into(),
             length: 4.0,
@@ -1180,6 +1182,8 @@ fn the_metronome_follows_a_tempo_edit() {
 
 fn with_utility(project: &mut Project) {
     project.channels[0].devices.push(Device {
+        instrument: false,
+        inputs: Vec::new(),
         id: Default::default(),
         name: "Utility".into(),
         kind: DeviceKind::Builtin("utility".into()),
@@ -1264,6 +1268,8 @@ fn a_device_parameter_on_the_main_channel_is_heard_from_the_next_block() {
     project.channels.push(main);
     if let Some(main) = project.channels.last_mut() {
         main.devices.push(Device {
+            instrument: false,
+            inputs: Vec::new(),
             id: Default::default(),
             name: "Utility".into(),
             kind: DeviceKind::Builtin("utility".into()),
@@ -2219,4 +2225,32 @@ fn a_modes_settings_change_its_sound() {
         let differ = one.iter().zip(&two).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max);
         assert!(differ > 0.01, "{mode:?}: {a:?} and {b:?} sound the same");
     }
+}
+
+/// A note's velocity range is rolled on each pass of a looping arrangement clip, within the range,
+/// and the same again when the notes are laid out again: an offline render repeats (ADR 0037).
+#[test]
+fn a_velocity_range_rolls_on_each_pass_and_repeats() {
+    let note = Note { velocity_range: 20, ..Note::new(0.0, 0.25, 60, 100.0 / 127.0) };
+    let lane = ContentLane { target: None, data: LaneData::Notes(vec![note].into()) };
+    let mut placed = clip(0.0, 64.0);
+    placed.loop_range = Some(LoopRange { start: 0.0, end: 1.0 });
+    let map = Transport::default().tempo_map(48_000.0);
+    let velocities = || {
+        let mut events = Vec::new();
+        collect_notes(&placed, &lane, &map, (TrackId(1), 1.0, 1.0, 0, 0, 0), None, 0.0, &mut events);
+        events.sort_by_key(|e| e.start);
+        events.iter().map(|e| (e.velocity * 127.0).round() as i32).collect::<Vec<_>>()
+    };
+    let first = velocities();
+    assert_eq!(first.len(), 64);
+    assert!(first.iter().all(|v| (100..=120).contains(v)), "{first:?}");
+    assert!(first.windows(2).any(|w| w[0] != w[1]), "the passes vary: {first:?}");
+    assert_eq!(first, velocities(), "laid out again, the same velocities");
+    // Without a range every pass plays the note's own velocity.
+    let plain =
+        ContentLane { target: None, data: LaneData::Notes(vec![Note::new(0.0, 0.25, 60, 100.0 / 127.0)].into()) };
+    let mut events = Vec::new();
+    collect_notes(&placed, &plain, &map, (TrackId(1), 1.0, 1.0, 0, 0, 0), None, 0.0, &mut events);
+    assert!(events.iter().all(|e| e.velocity == 100.0 / 127.0));
 }

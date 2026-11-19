@@ -4,7 +4,7 @@ read_when: theme, style sheet, CSS, selector, cascade, media query, layout, taff
 type: decision
 status: proposed
 built: partly
-last_verified: 2026-11-16
+last_verified: 2026-11-18
 covers:
   - crates/style/
   - crates/ui/src/kit/theme.rs
@@ -274,8 +274,9 @@ and its children agree in the same frame. The elements of a frame form a tree, b
 depth (section 9), that selectors match against; its ancestry and siblings are the ones drawn.
 
 Every element type, id, class and state lives in one registry with a sentence on what it is. The
-registry turns typos into warnings ("no element called `buton`") and writes the theme template's
-README, so an agent can write a theme from the README alone.
+registry turns typos into warnings ("no element called `buton`"); the theme author guide
+(`docs/guide/theme-authoring.md`) lists what it holds, so an agent can write a theme from the guide
+alone (*Amendment: no guide in theme files*).
 
 ### 3. Media queries
 
@@ -286,7 +287,8 @@ README, so an agent can write a theme from the README alone.
 | --- | --- |
 | `width`, `height`, `aspect-ratio`, `orientation` | The window (with `min-` and `max-`) |
 | `resolution` | The display's scale factor (`2dppx` on a Retina screen) |
-| `prefers-contrast`, `prefers-reduced-motion`, `prefers-reduced-transparency` | The OS settings (`prefers-color-scheme` is not supported: amendment of 2026-11-10) |
+| `prefers-contrast`, `prefers-reduced-motion`, `prefers-reduced-transparency` | The OS settings |
+| `prefers-color-scheme` | The scheme the variant in use declares (amendment of 2026-11-18) |
 | `transparency` | `on` when the window is transparent (section 6) |
 | `desktop-blur` | `on` when the OS blurs the desktop behind it |
 | `platform` | `windows`, `macos`, `linux` |
@@ -562,9 +564,9 @@ variables, so views move over one at a time and the snapshots must not change on
   rules that matched it with file and line, and its glass, like a browser's developer tools.
 - **Problems list:** Settings › Appearance lists every warning with file, line and column; a bad
   declaration is skipped and the rest of the sheet still applies.
-- **Template:** Export template writes the README of every element, class, state, media feature,
-  property and artwork part (from the registries), the default style sheet and the default artwork,
-  for people and agents. Every exported theme carries the same README.
+- **Template:** *(Removed, see Amendment: no guide in theme files.)* Export template wrote the
+  README of every element, class, state, media feature, property and artwork part, the default
+  style sheet and the default artwork, and every exported theme carried the same README.
 - **Example themes:** besides Suhina Studio, the built-in themes include PR 841's Sheet, Meadow and
   Blocks, rewritten as style sheets with their original artwork, so authors start from working
   examples of artwork, density and glass.
@@ -888,7 +890,15 @@ open.
   used, which knows its siblings and carries its transitions and animations. At the end of the
   frame the whole tree is resolved as before, and another frame is asked for only when a style
   painted differs from the tree's: sibling-dependent selectors (`+`, `~`, `:nth-child`) and a
-  hover that reaches an ancestor, which still wait a frame. The approximation from class names
+  hover that reaches an ancestor, which still wait a frame. The whole tree's resolve shares its
+  styles too (`cascade::compute_shared`, #1489): each element's place, compared in full and
+  never by a hash alone, is its parent's place, its own identity, the device sheets it is the root of and, only when a sheet needs them, its place
+  and earlier siblings or whether it has children, and an element whose place was seen before
+  takes the style kept for it. A tree that changed in a few elements (a hover, a splitter
+  being dragged) works out only those and what is under them, and identical elements share one
+  computation; the cache empties when the viewport or a sheet changes. Without it every change
+  cost the whole window's cascade, 75 ms a frame in Suhina Blocks, whose regions set variables
+  of their own. The approximation from class names
   is gone. A theme change or a hover change needs no frame of the style engine's own (the budget
   test holds `*_style_frames` at zero); the frame left after a theme change is egui's after a
   new palette. An element with a transition keeps its painted values in the frame its target
@@ -1327,4 +1337,31 @@ status*) and, for the track headers, the mixer strips and the transport, decisio
   keep the SDK's layout until [#1009](https://github.com/suhina-daw/suhina-daw/issues/1009)) and
   of the toolbar's modules (`toolbar-NAME`; `theme.json`'s toolbar order and offsets stay).
   Themes are not migrated (pre-alpha): the built-in Suhina Sheet, Blocks and Meadow had their
-  mixer placements, which are now rules of their sheets (`mixer meter { order: -1 }`).
+  mixer placements, which are now rules of their sheets (`mixer meter { order: -1 }`). A sheet
+  that still sets one of the removed properties (`left`, `top`, `right`, `bottom`, `direction`,
+  `anchor-*`, `--suhina-direction` or `compact-below`) gets a notice naming what to write
+  instead, and the value is not kept (#1478).
+
+## Amendment: no guide in theme files (2026-11-16)
+
+Issue #1022. Suhina no longer writes a README or example sheets into the theme folders it makes,
+the packages it exports or the backups it writes, and *Export template* is gone. The author guide
+is a document of the repository, [`docs/guide/theme-authoring.md`](../guide/theme-authoring.md),
+with every colour token and its Suhina Studio value; a test keeps that table in step with the
+token registry. A README an author put in a theme's folder is the author's, and travels with it.
+
+## Amendment: a theme declares its colour scheme (2026-11-18)
+
+This replaces the amendment of 2026-11-10's refusal of `prefers-color-scheme`. Lightness was
+worked out from the window's computed text colour, an output of the cascade, so a sheet that asked
+for the scheme could flip it on every reset. The scheme is now an input:
+
+- `theme.json` and each variant file say `"color-scheme": "light"` or `"dark"`; a variant that
+  says nothing has its theme's, and a theme that says nothing is dark. The variant editor has a
+  *Colour scheme* control for it.
+- Every sheet may use `@media (prefers-color-scheme: …)` and `light-dark(<light>, <dark>)`; the
+  styles reset when the scheme changes. A `light-dark()` value is checked in both schemes.
+- The native window's scheme (`theme::is_light`) is the declared one.
+- A device panel shows artwork in a light and a dark version by hiding one control with
+  `display: none` under `@media (prefers-color-scheme: …)`; the `#light` value its drawings and
+  `visible_when` read before is gone.

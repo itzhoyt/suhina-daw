@@ -172,3 +172,39 @@ fn the_canonical_form_folds_the_root_once_and_the_dot_steps_out() {
     #[cfg(windows)]
     assert_eq!(canonical_paths(r"C:\a\b"), "C:/a/b");
 }
+
+#[test]
+fn a_file_row_shows_its_name_without_the_extension() {
+    assert_eq!(row_name("Bug333-Clean-ESR0,002.nam"), "Bug333-Clean-ESR0,002");
+    assert_eq!(row_name("Cab 412.WAV"), "Cab 412");
+    assert_eq!(row_name("Model metadata name"), "Model metadata name", "a model's own name keeps all of it");
+    assert_eq!(row_name(".nam"), "", "an extension alone leaves nothing, never a panic");
+    assert_eq!(GROUP_JOIN, " / ", "the join the folder scan writes a capture folder's pack name with");
+}
+
+/// A stepper's triangle is the colour of the row's drop-down arrows, not of a button's text.
+#[test]
+fn a_steppers_triangle_takes_the_dropdown_arrow_colour() {
+    let css = "button { color: #00FF00; } dropdown-arrow { color: #FF00FF; }";
+    crate::kit::skin::configure(&crate::kit::skin::Skin { css: Some(css.into()), ..Default::default() });
+    let ctx = egui::Context::default();
+    let mut shapes = Vec::new();
+    for _ in 0..3 {
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let _frame = crate::kit::native_css::frame(ui);
+            let rect = Rect::from_min_size(egui::pos2(10.0, 10.0), egui::vec2(16.0, 20.0));
+            stepper(ui, rect, egui::Id::unique("step"), true, "Previous".into());
+        });
+        output.textures_delta.clear();
+        shapes = output.shapes;
+    }
+    crate::kit::skin::configure(&crate::kit::skin::Skin::default());
+    let fills: Vec<egui::Color32> = shapes
+        .iter()
+        .filter_map(|shape| match &shape.shape {
+            egui::Shape::Path(path) if path.closed => Some(path.fill),
+            _ => None,
+        })
+        .collect();
+    assert!(fills.contains(&egui::Color32::from_rgb(0xFF, 0x00, 0xFF)), "{fills:?}");
+}

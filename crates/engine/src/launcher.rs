@@ -158,6 +158,9 @@ pub enum LaunchCommand {
     },
     /// The metronome's click sound from the next click on.
     SetMetronomeSound(crate::ClickSound),
+    /// Whether a track with no instrument of its own plays its notes as sine tones (#1384): the
+    /// user's setting, off by default in the app. Notes sounding go on to their ends.
+    SetImplicitTones(bool),
     /// While the transport runs, playback jumps to `beat` at once, as [`LaunchCommand::SetPosition`]
     /// does, but the play start marker stays where it is. Ignored while stopped (the playhead is
     /// at the marker then) and for non-finite beats. A pending start waiting for read-ahead
@@ -374,6 +377,11 @@ pub struct LauncherMonitor {
     pub(crate) plugin_misses: AtomicU64,
     pub(crate) worst_plugin: AtomicU64,
     pub(crate) worst_misses: AtomicU64,
+    /// Blocks a chain came back from a render worker after its deadline (ADR 0038 › 3), and
+    /// the track (its id) that missed most with its count.
+    pub(crate) render_misses: AtomicU64,
+    pub(crate) worst_render_track: AtomicU64,
+    pub(crate) worst_render_misses: AtomicU64,
     /// Plug-in blocks that were not sent at all (the host was still busy with an earlier one),
     /// summed over the playing graph's slots.
     pub(crate) plugin_blocked: AtomicU64,
@@ -447,6 +455,9 @@ impl LauncherMonitor {
             plugin_misses: AtomicU64::new(0),
             worst_plugin: AtomicU64::new(0),
             worst_misses: AtomicU64::new(0),
+            render_misses: AtomicU64::new(0),
+            worst_render_track: AtomicU64::new(0),
+            worst_render_misses: AtomicU64::new(0),
             plugin_blocked: AtomicU64::new(0),
             worst_trip: AtomicU32::new(0),
             frames_per_beat: AtomicU64::new(0),
@@ -607,8 +618,11 @@ struct PlanNote {
     duration: f64,
     frequency: f64,
     key: u8,
-    velocity: f32,
+    /// The note as the clip holds it: its velocity and velocity range, rolled where it starts
+    /// (ADR 0037).
+    note: suhina_model::Note,
     track: suhina_model::TrackId,
+    /// The track's gains, which the played velocity multiplies.
     gain_left: f32,
     gain_right: f32,
     /// 0 for the output, or 1 + the index of the track's chain.
@@ -662,6 +676,13 @@ impl ClipPlan {
         }
     }
 
+    /// The passes through the loop completed `elapsed` beats after the launch: what
+    /// [`Playing::passes`] counts by then, so a clip that resumes or takes over a position rolls
+    /// its notes as the uninterrupted playback would (ADR 0037).
+    fn pass_at(&self, elapsed: f64) -> u64 {
+        loop_passes(self.offset, self.loop_range, elapsed)
+    }
+
     /// Notes end here: the loop end, or the end marker.
     fn note_limit(&self) -> f64 {
         self.loop_range.map_or(self.offset + self.length, |(_, end)| end)
@@ -681,6 +702,22 @@ struct SlotPlan {
     has_stop: bool,
 }
 
+/// The loop passes completed `elapsed` beats after a launch from `offset`, counted as a launch
+/// counts them: one more each time playback reaches the loop's end, and, for a start marker at or
+/// past that end, one at once, as the clip turns into the loop as soon as it starts.
+fn loop_passes(offset: f64, loop_range: Option<(f64, f64)>, elapsed: f64) -> u64 {
+    let Some((start, end)) = loop_range.filter(|(start, end)| end > start) else { return 0 };
+    let from = suhina_model::played_from(offset, loop_range);
+    let turned = u64::from(offset >= end);
+    let beat = from + elapsed;
+    if beat < end {
+        return turned;
+    }
+    // `as` saturates a quotient past u64 (a loop vanishingly short for the time played), and the
+    // passes after it saturate too rather than wrapping.
+    (((beat - end) / (end - start)).floor() as u64).saturating_add(1).saturating_add(turned)
+}
+
 /// A clip that is playing or fading out.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Playing {
@@ -689,6 +726,9 @@ pub(crate) struct Playing {
     elapsed_frames: f64,
     last_clip_beat: f64,
     next_note: usize,
+    /// The passes through the clip's loop since the launch, from 0: the notes' rolled velocities
+    /// differ from pass to pass (ADR 0037).
+    passes: u64,
     /// Frames of fade-out left, while stopping.
     pub(crate) fade_left: f64,
     /// Whether this playback uses the clip's stretch voices; it stops using them for good when
@@ -1082,7 +1122,6 @@ fn plan_clip(
                 // The clip's swing, its own or the project's, in its content's beats (#1221).
                 let swing = clip.swing.effective(project.transport.swing);
                 for note in lane_notes.iter().filter(|n| !n.muted && n.time.is_finite() && n.duration.is_finite()) {
-                    let velocity = note_velocity(note.velocity);
                     // The end swings as the start does, so notes that touch keep touching.
                     let time = suhina_model::swung(note.time, swing);
                     let end = suhina_model::swung(note.time + note.duration.max(0.0), swing);
@@ -1091,10 +1130,10 @@ fn plan_clip(
                         duration: (end - time).max(0.0),
                         frequency: 440.0 * 2f64.powf((f64::from(note.key) - 69.0) / 12.0),
                         key: note.key.min(127),
-                        velocity,
+                        note: *note,
                         track: lane_track,
-                        gain_left: gain_left * velocity,
-                        gain_right: gain_right * velocity,
+                        gain_left,
+                        gain_right,
                         bus,
                         meter,
                         scale: crate::musical_scale(content.scale),
@@ -1288,6 +1327,12 @@ impl Renderer {
                 self.graph.launcher.monitor.metronome.store(self.metronome.on(), Ordering::Relaxed);
             }
             LaunchCommand::SetMetronomeSound(sound) => self.metronome.set_sound(sound),
+            LaunchCommand::SetImplicitTones(on) => {
+                self.implicit_tones = on;
+                for chain in &mut self.graph.chains {
+                    chain.tones_off = !on;
+                }
+            }
             LaunchCommand::SetCue { gain, separate } => self.cue.set(gain, separate),
             LaunchCommand::FollowTempoMap => {
                 self.graph.launcher.follow_map();
@@ -1422,6 +1467,7 @@ impl Renderer {
                     elapsed_frames: elapsed * frames_per_beat_now,
                     last_clip_beat: beat,
                     next_note: plan.first_note_from(beat),
+                    passes: plan.pass_at(elapsed),
                     fade_left: 0.0,
                     stretched,
                     // A follow action whose time had come ran on the old output already; one
@@ -1607,6 +1653,7 @@ impl Renderer {
                     elapsed_frames: 0.0,
                     last_clip_beat: plan.offset,
                     next_note: plan.first_note_from(plan.offset),
+                    passes: 0,
                     fade_left: 0.0,
                     stretched: self.graph.launcher.tempo_bpm == self.graph.launcher.project_tempo_bpm,
                     followed: false,
@@ -1659,6 +1706,7 @@ impl Renderer {
             transport: crate::transport::Transport { position, .. },
             sample_rate,
             block_frame,
+            implicit_tones,
             ..
         } = self;
         let map = &graph.tempo;
@@ -1672,7 +1720,11 @@ impl Renderer {
         let limit = plan.note_limit();
         let beat = plan.clip_beat(p.elapsed_beats);
         let song_beat = launcher.beat;
-        let mut start = |note: &PlanNote| {
+        let scene = p.slot as u64;
+        // Rolled where it starts (ADR 0037): integer arithmetic, nothing allocated or locked.
+        let mut start = |note: &PlanNote, pass: u64| {
+            let place = suhina_model::RollPlace { track: note.track.0, clip: scene, pass };
+            let velocity = note_velocity(suhina_model::played_velocity(&note.note, place));
             let beats = note.duration.min(limit - note.time).max(0.0);
             // A note's length in frames follows the tempo map from where it starts.
             let frames = if on_map {
@@ -1684,29 +1736,30 @@ impl Renderer {
             let start = NoteStart {
                 frequency: note.frequency,
                 key: note.key,
-                velocity: note.velocity,
+                velocity,
                 track: note.track,
-                gains: (note.gain_left, note.gain_right),
+                gains: (note.gain_left * velocity, note.gain_right * velocity),
                 column: column_id,
                 bus: note.bus,
                 meter: note.meter,
                 scale: note.scale,
                 arranged: false,
             };
-            start_note(voices, chains, frame, *position, *sample_rate, end, start);
+            start_note(voices, chains, frame, *position, *sample_rate, end, start, *implicit_tones);
         };
         if let Some((loop_start, loop_end)) = plan.loop_range
             && beat < p.last_clip_beat
         {
             // Wrapped: finish the notes before the loop end, then start the loop again.
             while let Some(note) = plan.notes.get(p.next_note).filter(|n| n.time < loop_end) {
-                start(note);
+                start(note, p.passes);
                 p.next_note += 1;
             }
             p.next_note = plan.first_note_from(loop_start);
+            p.passes = p.passes.wrapping_add(1);
         }
         while let Some(note) = plan.notes.get(p.next_note).filter(|n| n.time <= beat && n.time < limit) {
-            start(note);
+            start(note, p.passes);
             p.next_note += 1;
         }
         p.last_clip_beat = beat;
